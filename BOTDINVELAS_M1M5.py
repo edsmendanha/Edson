@@ -800,41 +800,357 @@ def is_harami_bullish(prev_c, cur_c) -> bool:
     return True
 
 
-def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not velas or len(velas) < 6:
-        return None
-    period = tf_min * 60
-    c2 = velas[-2]
-    c1 = velas[-3]
-    pattern_from = int(c2.get("from", 0))
-    expected_confirm_from = pattern_from + period
+# =========================
+# MOTOR DE REVERSÃO V15
+# Score/contexto/sustentação, impulso, wick, RSI, BB.
+# Substitui completamente a detecção e confirmação reversal da v14.
+# Padrões breakout/harami/hammer preservados como fallback.
+# =========================
 
-    if is_harami_bearish(c1, c2):
-        return {"pattern_name": "HaramiBearish", "direction_hint": "put", "requires_confirmation": True,
-                "pattern_from": pattern_from, "expected_confirm_from": expected_confirm_from}
-    if is_harami_bullish(c1, c2):
-        return {"pattern_name": "HaramiBullish", "direction_hint": "call", "requires_confirmation": True,
-                "pattern_from": pattern_from, "expected_confirm_from": expected_confirm_from}
-    if is_hammer(c2):
-        return {"pattern_name": "Hammer", "direction_hint": "call", "requires_confirmation": True,
-                "pattern_from": pattern_from, "expected_confirm_from": expected_confirm_from}
+# --- Parâmetros fixos do motor V15 (bloco centralizado, não dispersar) ---
+V15_SCORE_MIN = 80           # Score mínimo para sinal reversal V15 (0–100)
+V15_CONFIRM_POLLS = 3        # Polls consecutivos de confirmação sustentada necessários
+V15_RSI_PERIOD = 14          # Período RSI
+V15_RSI_OVERSOLD = 30        # RSI abaixo deste valor = oversold → sinal call
+V15_RSI_OVERBOUGHT = 70      # RSI acima deste valor = overbought → sinal put
+V15_BB_PERIOD = 20           # Período Bollinger Bands
+V15_BB_STD = 2.0             # Multiplicador de desvio padrão para BB
+V15_BB_PROXIMITY = 0.20      # Fração da largura da banda para considerar "próximo do extremo"
+V15_IMPULSE_LOOKBACK = 5     # Número de velas para cálculo de impulso (tendência recente)
+V15_CONTEXT_LOOKBACK = 12    # Número de velas para contexto de tendência prévia
+V15_WICK_RATIO = 0.45        # Wick mínimo (wick/range) para pontuar sombra longa
+V15_CANDLES_NEEDED = 40      # Mínimo de velas para o motor V15 funcionar
+# Thresholds internos do motor (ajustáveis para calibração fina)
+V15_TREND_THRESHOLD = 0.0008   # Variação mínima relativa para considerar tendência (não sideways)
+V15_IMPULSE_THRESHOLD = 0.001  # Variação mínima relativa de impulso para pontuar contexto
+V15_IMPULSE_MULTIPLIER = 8000  # Fator de escala: impulso*fator → pontos (capado em 25)
+V15_WICK_SCORE_MAX = 25        # Pontuação máxima por componente wick
+V15_WICK_SCORE_FACTOR = 35     # Fator multiplicador: wick_ratio*fator → pontos brutos
+
+
+def _v15_rsi(closes: List[float], period: int = 14) -> Optional[float]:
+    """Calcula RSI (Relative Strength Index) com suavização Wilder."""
+    if len(closes) < period + 2:
+        return None
+    # Seed com as primeiras 'period' diferenças
+    gains, losses = [], []
+    for i in range(1, period + 1):
+        delta = closes[i] - closes[i - 1]
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    # Wilder smoothing para as velas restantes
+    for i in range(period + 1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        avg_gain = (avg_gain * (period - 1) + max(delta, 0.0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-delta, 0.0)) / period
+    if abs(avg_loss) < 1e-10:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _v15_bollinger(closes: List[float], period: int = 20,
+                   std_mult: float = 2.0) -> Optional[Tuple[float, float, float]]:
+    """Retorna (upper, middle, lower) das Bandas de Bollinger."""
+    if len(closes) < period:
+        return None
+    window = closes[-period:]
+    mean = sum(window) / period
+    var = sum((x - mean) ** 2 for x in window) / period
+    sd = var ** 0.5
+    return mean + std_mult * sd, mean, mean - std_mult * sd
+
+
+def _v15_impulse(velas: List[Dict[str, Any]], lookback: int = 5) -> Optional[float]:
+    """
+    Calcula impulso como variação normalizada dos fechamentos nas últimas
+    'lookback' velas. Positivo = alta recente, Negativo = queda recente.
+    """
+    if len(velas) < lookback + 1:
+        return None
+    closes = [float(v["close"]) for v in velas[-(lookback + 1):]]
+    base = closes[0] if abs(closes[0]) > 1e-10 else 1e-12
+    return (closes[-1] - closes[0]) / abs(base)
+
+
+def _v15_context(velas: List[Dict[str, Any]], lookback: int = 12) -> Optional[str]:
+    """
+    Retorna contexto de tendência prévia: 'downtrend', 'uptrend' ou 'sideways'.
+    Analisa somente velas antes da vela candidata (excluindo as 2 últimas).
+    """
+    if len(velas) < lookback + 3:
+        return None
+    # Pega as velas antes das 2 últimas (candidata e in-progress)
+    ctx_velas = velas[-(lookback + 2):-2]
+    if len(ctx_velas) < 2:
+        return None
+    closes = [float(v["close"]) for v in ctx_velas]
+    half = max(1, len(closes) // 2)
+    first_avg = sum(closes[:half]) / half
+    second_avg = sum(closes[half:]) / max(1, len(closes) - half)
+    base = abs(first_avg) if abs(first_avg) > 1e-10 else 1e-12
+    change = (second_avg - first_avg) / base
+    if change < -V15_TREND_THRESHOLD:
+        return "downtrend"
+    if change > V15_TREND_THRESHOLD:
+        return "uptrend"
+    return "sideways"
+
+
+def _v15_wick_score(c: Dict[str, Any]) -> Tuple[int, Optional[str]]:
+    """
+    Pontua a sombra (wick) da vela candidata para sinal de reversão.
+      Wick inferior longo → reversão de alta (call).
+      Wick superior longo → reversão de baixa (put).
+    Retorna (pontos: 0–25, 'call'|'put'|None).
+    """
+    p = _candle_parts(c)
+    rng = max(p["high"] - p["low"], 1e-12)
+    lower_wick = min(p["open"], p["close"]) - p["low"]
+    upper_wick = p["high"] - max(p["open"], p["close"])
+    lower_ratio = lower_wick / rng
+    upper_ratio = upper_wick / rng
+    if lower_ratio >= V15_WICK_RATIO and lower_ratio > upper_ratio:
+        # Sombra inferior dominante → call (suporte rejeitado)
+        pts = int(min(V15_WICK_SCORE_MAX, lower_ratio * V15_WICK_SCORE_FACTOR))
+        return pts, "call"
+    if upper_ratio >= V15_WICK_RATIO and upper_ratio > lower_ratio:
+        # Sombra superior dominante → put (resistência rejeitada)
+        pts = int(min(V15_WICK_SCORE_MAX, upper_ratio * V15_WICK_SCORE_FACTOR))
+        return pts, "put"
+    return 0, None
+
+
+def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    MOTOR DE REVERSÃO V15
+    ─────────────────────
+    Detecta sinais de reversão por score composto (máximo 100 pontos):
+      • RSI         (0–25 pts): oversold/overbought indica exaustão da tendência
+      • BB          (0–25 pts): preço próximo das bandas extremas
+      • Wick        (0–25 pts): sombra longa indica rejeição de preço
+      • Impulso+Ctx (0–25 pts): tendência prévia confirma contexto reversal
+
+    Sinal disparado quando score >= V15_SCORE_MIN (padrão 80) e
+    a direção vencedora supera a oposta.
+
+    Fallback v14: Harami Bearish/Bullish e Hammer preservados para
+    casos onde o motor V15 não atinge pontuação mínima.
+    """
+    if not velas or len(velas) < max(V15_CANDLES_NEEDED, 6):
+        return None
+
+    period = tf_min * 60
+    c_last = velas[-2]   # vela candidata (penúltima, já fechada)
+    c_prev = velas[-3]   # vela anterior (para fallback harami)
+    pattern_from = int(c_last.get("from", 0))
+    expected_confirm_from = pattern_from + period
+    closes = [float(v["close"]) for v in velas]
+
+    # ── Componente RSI (0–25 pts) ──────────────────────────────────────────
+    rsi = _v15_rsi(closes, V15_RSI_PERIOD)
+    rsi_pts = 0
+    rsi_dir: Optional[str] = None
+    if rsi is not None:
+        if rsi <= V15_RSI_OVERSOLD:
+            rsi_pts, rsi_dir = 25, "call"
+        elif rsi <= V15_RSI_OVERSOLD + 10:
+            rsi_pts, rsi_dir = 12, "call"
+        elif rsi >= V15_RSI_OVERBOUGHT:
+            rsi_pts, rsi_dir = 25, "put"
+        elif rsi >= V15_RSI_OVERBOUGHT - 10:
+            rsi_pts, rsi_dir = 12, "put"
+
+    # ── Componente BB (0–25 pts) ───────────────────────────────────────────
+    bb = _v15_bollinger(closes, V15_BB_PERIOD, V15_BB_STD)
+    bb_pts = 0
+    bb_dir: Optional[str] = None
+    if bb is not None:
+        upper, _mid, lower = bb
+        band_width = max(upper - lower, 1e-12)
+        price = float(c_last.get("close", closes[-2]))
+        prox_thr = band_width * V15_BB_PROXIMITY
+        dist_lower = price - lower
+        dist_upper = upper - price
+        if dist_lower <= prox_thr and dist_lower >= 0:
+            frac = max(0.0, 1.0 - dist_lower / max(prox_thr, 1e-12))
+            bb_pts, bb_dir = int(frac * 25), "call"
+        elif dist_lower < 0:
+            # Preço abaixo da banda inferior: máximos pontos call
+            bb_pts, bb_dir = 25, "call"
+        elif dist_upper <= prox_thr and dist_upper >= 0:
+            frac = max(0.0, 1.0 - dist_upper / max(prox_thr, 1e-12))
+            bb_pts, bb_dir = int(frac * 25), "put"
+        elif dist_upper < 0:
+            # Preço acima da banda superior: máximos pontos put
+            bb_pts, bb_dir = 25, "put"
+
+    # ── Componente Wick (0–25 pts) ─────────────────────────────────────────
+    wick_pts, wick_dir = _v15_wick_score(c_last)
+
+    # ── Componente Impulso + Contexto (0–25 pts) ───────────────────────────
+    # Tendência prévia de queda + impulso negativo → contexto para call (reversão)
+    # Tendência prévia de alta + impulso positivo → contexto para put (reversão)
+    impulse = _v15_impulse(velas, V15_IMPULSE_LOOKBACK)
+    context = _v15_context(velas, V15_CONTEXT_LOOKBACK)
+    imp_pts = 0
+    imp_dir: Optional[str] = None
+    if impulse is not None and context is not None:
+        if context == "downtrend" and impulse < -V15_IMPULSE_THRESHOLD:
+            imp_pts = int(min(V15_WICK_SCORE_MAX, abs(impulse) * V15_IMPULSE_MULTIPLIER))
+            imp_dir = "call"
+        elif context == "uptrend" and impulse > V15_IMPULSE_THRESHOLD:
+            imp_pts = int(min(V15_WICK_SCORE_MAX, abs(impulse) * V15_IMPULSE_MULTIPLIER))
+            imp_dir = "put"
+
+    # ── Soma de scores por direção ─────────────────────────────────────────
+    call_score = (rsi_pts if rsi_dir == "call" else 0) + \
+                 (bb_pts if bb_dir == "call" else 0) + \
+                 (wick_pts if wick_dir == "call" else 0) + \
+                 (imp_pts if imp_dir == "call" else 0)
+    put_score  = (rsi_pts if rsi_dir == "put" else 0) + \
+                 (bb_pts if bb_dir == "put" else 0) + \
+                 (wick_pts if wick_dir == "put" else 0) + \
+                 (imp_pts if imp_dir == "put" else 0)
+
+    # ── Disparo do sinal V15 ───────────────────────────────────────────────
+    if call_score >= V15_SCORE_MIN and call_score > put_score:
+        return {
+            "pattern_name": "ReversalV15_CALL",
+            "direction_hint": "call",
+            "requires_confirmation": True,
+            "pattern_from": pattern_from,
+            "expected_confirm_from": expected_confirm_from,
+            "v15_score": call_score,
+            "v15_confirm_count": 0,
+            "pattern_mode": "v15",
+        }
+    if put_score >= V15_SCORE_MIN and put_score > call_score:
+        return {
+            "pattern_name": "ReversalV15_PUT",
+            "direction_hint": "put",
+            "requires_confirmation": True,
+            "pattern_from": pattern_from,
+            "expected_confirm_from": expected_confirm_from,
+            "v15_score": put_score,
+            "v15_confirm_count": 0,
+            "pattern_mode": "v15",
+        }
+
+    # ── Fallback v14: Harami Bearish / Bullish / Hammer ───────────────────
+    if is_harami_bearish(c_prev, c_last):
+        return {
+            "pattern_name": "HaramiBearish",
+            "direction_hint": "put",
+            "requires_confirmation": True,
+            "pattern_from": pattern_from,
+            "expected_confirm_from": expected_confirm_from,
+            "v15_score": 0,
+            "v15_confirm_count": 0,
+            "pattern_mode": "fallback",
+        }
+    if is_harami_bullish(c_prev, c_last):
+        return {
+            "pattern_name": "HaramiBullish",
+            "direction_hint": "call",
+            "requires_confirmation": True,
+            "pattern_from": pattern_from,
+            "expected_confirm_from": expected_confirm_from,
+            "v15_score": 0,
+            "v15_confirm_count": 0,
+            "pattern_mode": "fallback",
+        }
+    if is_hammer(c_last):
+        return {
+            "pattern_name": "Hammer",
+            "direction_hint": "call",
+            "requires_confirmation": True,
+            "pattern_from": pattern_from,
+            "expected_confirm_from": expected_confirm_from,
+            "v15_score": 0,
+            "v15_confirm_count": 0,
+            "pattern_mode": "fallback",
+        }
+
     return None
 
 
 def confirm_pending(tf_min: int, pending: Dict[str, Any], velas: List[Dict[str, Any]]) -> Tuple[str, Optional[str]]:
+    """
+    CONFIRMAÇÃO DE REVERSÃO V15
+    ───────────────────────────
+    Para sinais V15 (pattern_mode='v15'):
+      Requer V15_CONFIRM_POLLS polls consecutivos onde o preço confirma
+      a direção prevista (acima/abaixo do fechamento da vela de sinal).
+      NOTA: modifica pending['v15_confirm_count'] diretamente a cada poll
+      para rastrear o progresso de sustentação (efeito colateral intencional).
+
+    Para sinais fallback (pattern_mode='fallback': harami/hammer):
+      Usa a lógica clássica da v14 — confirmação na vela seguinte
+      ao padrão (candle close versus referência).
+
+    Retorna:
+      ("confirmed", direction) — sinal confirmado, pode entrar
+      ("waiting", None)        — aguardando mais dados/polls
+      ("rejected", None)       — sinal inválido, descartar
+      ("expired", None)        — fora do prazo de validade
+      ("error", None)          — dados insuficientes
+    """
     period = tf_min * 60
     pattern_from = int(pending["pattern_from"])
     expected_confirm_from = int(pending["expected_confirm_from"])
     expire_from = pattern_from + (PENDING_EXPIRE_CANDLES * period)
+    direction_hint = pending.get("direction_hint", "call")
+    pattern_mode = pending.get("pattern_mode", "fallback")
 
     now_server = int(API.get_server_timestamp())
     if now_server >= expire_from + 2:
         return "expired", None
 
     c_pattern = _find_candle_by_from(velas, pattern_from)
-    c_next = _find_candle_by_from(velas, expected_confirm_from)
     if c_pattern is None:
         return "error", None
+
+    # ─── Confirmação V15: sustentação por múltiplos polls ─────────────────
+    if pattern_mode == "v15":
+        # Aguarda abertura da janela de confirmação
+        if now_server < expected_confirm_from:
+            return "waiting", None
+
+        # Referência: fechamento da vela de sinal
+        p_ref = float(c_pattern.get("close", 0))
+        if p_ref == 0:
+            return "error", None
+
+        # Usa a última vela disponível para comparar preço atual
+        c_confirm = velas[-1] if velas else None
+        if c_confirm is None:
+            return "waiting", None
+
+        c_price = float(c_confirm.get("close", c_confirm.get("open", p_ref)))
+
+        # Verifica confirmação de direção no poll atual
+        confirmed_now = (direction_hint == "call" and c_price > p_ref) or \
+                        (direction_hint == "put" and c_price < p_ref)
+
+        if confirmed_now:
+            # Incrementa contador de polls confirmados consecutivos
+            pending["v15_confirm_count"] = pending.get("v15_confirm_count", 0) + 1
+            if pending["v15_confirm_count"] >= V15_CONFIRM_POLLS:
+                return "confirmed", direction_hint
+            return "waiting", None
+        else:
+            # Poll falhou: reseta contador de sustentação
+            pending["v15_confirm_count"] = 0
+            # Se passou 1 período inteiro após o esperado sem confirmar, rejeita
+            if now_server >= expected_confirm_from + period:
+                return "rejected", None
+            return "waiting", None
+
+    # ─── Confirmação fallback v14: harami/hammer (lógica clássica) ────────
+    c_next = _find_candle_by_from(velas, expected_confirm_from)
     if c_next is None:
         return "waiting", None
 
