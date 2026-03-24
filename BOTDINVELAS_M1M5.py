@@ -17,7 +17,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from configobj import ConfigObj
 from iqoptionapi.stable_api import IQ_Option
 
-BOTDIN_VERSION = "2026-03-24-v15.1-m5-extremefilter"
+BOTDIN_VERSION = "2026-03-24-v15.1-m5-extremefilter-reversalonly"
 
 # =========================
 # CONFIG
@@ -1574,14 +1574,15 @@ def ask_entry_mode():
     print("\n" + "=" * 70)
     print("🧠 MODO DE ENTRADA")
     print("=" * 70)
-    print("  1) REVERSÃO")
-    print("  2) ROMPIMENTO")
+    print("  1) REVERSÃO  ✅ (único modo disponível nesta versão)")
+    print("  2) ROMPIMENTO  🚧 (em desenvolvimento — indisponível)")
     while True:
-        r = input("\n���� Digite 1 ou 2 [1]: ").strip() or "1"
+        r = input("\n👉 Pressione Enter para continuar com REVERSÃO: ").strip() or "1"
         if r == "1":
             return "reversal"
         if r == "2":
-            return "breakout"
+            print("⚠️  O modo ROMPIMENTO ainda não está disponível. Selecione 1 para REVERSÃO.")
+            continue
 
 
 def ask_rigidez():
