@@ -17,7 +17,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from configobj import ConfigObj
 from iqoptionapi.stable_api import IQ_Option
 
-BOTDIN_VERSION = "2026-03-25-m5-minimal-multiativo"
+BOTDIN_VERSION = "2026-03-25-m5-dynrecheck"
 
 # =========================
 # CONFIG
@@ -174,6 +174,9 @@ EARLY_LOSS_GUARD_SECONDS = 55
 EARLY_LOSS_STABLE_SAMPLES = 4
 EARLY_LOSS_SAMPLE_INTERVAL_S = 1.5
 EARLY_LOSS_EPS = 0.02
+
+# Número de ciclos de IDLE_SLEEP_S_M5 a aguardar quando pool de ativos está vazio
+EMPTY_POOL_SLEEP_MULTIPLIER = 10
 
 # Presets
 PRESET_PATH: Optional[Path] = None
@@ -1619,6 +1622,15 @@ def build_asset_list(use_otc: bool, max_count: int) -> List[Tuple[str, str]]:
     return result
 
 
+def build_candidate_pool(use_otc: bool, limit: int = 200) -> List[Tuple[str, str]]:
+    """Retorna todos os candidatos disponíveis (favoritos primeiro, depois resto do book).
+
+    Igual a build_asset_list mas com limite generoso para varredura dinâmica.
+    Não aplica o limite do usuário — o chamador filtra o que já está ativo.
+    """
+    return build_asset_list(use_otc=use_otc, max_count=limit)
+
+
 def ask_market_type() -> bool:
     """Pergunta tipo de mercado. Retorna True para OTC, False para Mercado Aberto (-OP)."""
     print("\n" + "=" * 70)
@@ -2203,19 +2215,47 @@ def loop_patterns(ativo: str, ativo_chave: str, tf_min: int, runtime_seconds: Op
 # =========================
 # LOOP MULTI-ATIVO (M5)
 # =========================
-def loop_patterns_multi(ativos: List[Tuple[str, str]], tf_min: int):
-    """Orquestra múltiplos ativos em único ciclo (M5). Stops globais pelo saldo."""
+def loop_patterns_multi(
+    ativos: List[Tuple[str, str]],
+    tf_min: int,
+    max_ativos: int = 0,
+    use_otc: bool = False,
+):
+    """Orquestra múltiplos ativos em único ciclo (M5). Stops globais pelo saldo.
+
+    Gestão dinâmica de ativos:
+    - Se um ativo falhar na entrada (buy), é removido imediatamente e o bot
+      tenta preencher com outro disponível em M5.
+    - A cada novo candle, re-verifica o pool completo (favoritos + book) e
+      re-inclui qualquer ativo que agora aceite M5 (sem ban permanente).
+    - Se não houver ativos disponíveis, aguarda e continua tentando a cada ciclo.
+    """
 
     period = tf_min * 60
     expiration = tf_min  # M5 -> expiração 5 min
+    _max_ativos = max_ativos if max_ativos > 0 else len(ativos)
 
-    # Estado por ativo
-    per_asset_pending: Dict[str, Optional[Dict[str, Any]]] = {a: None for a, _ in ativos}
-    per_asset_pending_id: Dict[str, Any] = {a: None for a, _ in ativos}
-    per_asset_lock_until: Dict[str, int] = {a: 0 for a, _ in ativos}
-    per_asset_last_idle_cid: Dict[str, Any] = {a: None for a, _ in ativos}
-    per_asset_last_pend_status_id: Dict[str, Any] = {a: None for a, _ in ativos}
+    # Lista mutável de ativos ativos
+    active_ativos: List[Tuple[str, str]] = list(ativos)
+
+    # Estado por ativo (crescente; chaves antigas inativas não atrapalham)
+    per_asset_pending: Dict[str, Optional[Dict[str, Any]]] = {}
+    per_asset_pending_id: Dict[str, Any] = {}
+    per_asset_lock_until: Dict[str, int] = {}
+    per_asset_last_idle_cid: Dict[str, Any] = {}
+    per_asset_last_pend_status_id: Dict[str, Any] = {}
     asset_last_pending_print: Dict[Any, float] = {}
+
+    def _init_asset_state(name: str) -> None:
+        if name not in per_asset_pending:
+            per_asset_pending[name] = None
+            per_asset_pending_id[name] = None
+            per_asset_lock_until[name] = 0
+            per_asset_last_idle_cid[name] = None
+            per_asset_last_pend_status_id[name] = None
+
+    for a, _ in active_ativos:
+        _init_asset_state(a)
 
     initial_bal = get_available_balance()
     stop_loss_threshold = None
@@ -2227,11 +2267,70 @@ def loop_patterns_multi(ativos: List[Tuple[str, str]], tf_min: int):
             stop_win_threshold = initial_bal * (1.0 + STOP_WIN_PCT / 100.0)
 
     console_event(
-        f"🚀 Loop M{tf_min} multi-ativo | {len(ativos)} ativo(s) | "
+        f"🚀 Loop M{tf_min} multi-ativo | {len(active_ativos)} ativo(s) | "
         f"Modo: REVERSÃO | tag={INSTANCE_TAG}"
     )
-    for a, ak in ativos:
+    for a, ak in active_ativos:
         console_event(f"  📊 {display_asset_name(a)} ({ak})")
+
+    # Controle do recheck por candle
+    last_recheck_cid: int = -1
+
+    def _refill_pool(now_cid: int) -> None:
+        """Re-verifica o pool completo e adiciona ativos M5 disponíveis."""
+        nonlocal last_recheck_cid
+        if now_cid == last_recheck_cid:
+            return
+        last_recheck_cid = now_cid
+
+        active_names = {a.upper() for a, _ in active_ativos}
+        try:
+            candidates = build_candidate_pool(use_otc=use_otc)
+        except Exception as exc:
+            _log_error("Falha ao buscar pool de candidatos em _refill_pool.", exc)
+            return
+        added = []
+        for candidate, cat in candidates:
+            if len(active_ativos) >= _max_ativos:
+                break
+            if candidate.upper() in active_names:
+                continue
+            active_ativos.append((candidate, cat))
+            _init_asset_state(candidate)
+            active_names.add(candidate.upper())
+            added.append(candidate)
+        if added:
+            console_event(
+                f"➕ Ativos re-incluídos no pool M5: "
+                + ", ".join(display_asset_name(a) for a in added)
+            )
+
+    def _replace_asset(failed_ativo: str) -> None:
+        """Remove ativo com falha e tenta preencher imediatamente com outro M5."""
+        nonlocal active_ativos
+        active_ativos = [(a, c) for a, c in active_ativos if a != failed_ativo]
+        console_event(
+            f"⚠️  [{display_asset_name(failed_ativo)}] Removido do pool "
+            f"(falha de entrada M5). Buscando substituto..."
+        )
+        active_names = {a.upper() for a, _ in active_ativos}
+        try:
+            candidates = build_candidate_pool(use_otc=use_otc)
+        except Exception as exc:
+            _log_error("Falha ao buscar pool de candidatos em _replace_asset.", exc)
+            return
+        for candidate, cat in candidates:
+            if len(active_ativos) >= _max_ativos:
+                break
+            if candidate.upper() in active_names:
+                continue
+            active_ativos.append((candidate, cat))
+            _init_asset_state(candidate)
+            active_names.add(candidate.upper())
+            console_event(
+                f"➕ [{display_asset_name(candidate)}] Adicionado como substituto M5."
+            )
+            break
 
     while True:
         # Verificação global de stop
@@ -2246,7 +2345,18 @@ def loop_patterns_multi(ativos: List[Tuple[str, str]], tf_min: int):
         now_server = int(API.get_server_timestamp())
         candle_id = now_server // period
 
-        for ativo, ativo_chave in ativos:
+        # Recheck completo do pool a cada novo candle (sem ban permanente)
+        _refill_pool(candle_id)
+
+        if not active_ativos:
+            console_event(
+                "⏸️  Nenhum ativo disponível em M5 no momento. "
+                "Aguardando abertura de mercado..."
+            )
+            time.sleep(IDLE_SLEEP_S_M5 * EMPTY_POOL_SLEEP_MULTIPLIER)
+            continue
+
+        for ativo, ativo_chave in list(active_ativos):
             pend = per_asset_pending[ativo]
             pend_id = per_asset_pending_id[ativo]
             lock_until = per_asset_lock_until[ativo]
@@ -2344,8 +2454,9 @@ def loop_patterns_multi(ativos: List[Tuple[str, str]], tf_min: int):
                         )
                         per_asset_pending[ativo] = None
                         per_asset_pending_id[ativo] = None
-                        per_asset_lock_until[ativo] = now_server + period
-                        continue
+                        # Remove ativo imediatamente e busca substituto M5
+                        _replace_asset(ativo)
+                        break
 
                     order_id = res.get("order_id")
                     console_event(
@@ -2487,19 +2598,18 @@ if __name__ == '__main__':
     RIGIDEZ_MODE = "normal"
     _apply_rigidez()
 
-    # Montar lista de ativos
+    # Montar lista de ativos inicial (pode estar vazia se mercado ainda fechado)
     print(f"\n🔍 Buscando ativos {market_label} disponíveis...")
     ativos_lista = build_asset_list(use_otc=use_otc, max_count=max_ativos)
     if not ativos_lista:
         print(
-            f"❌ Nenhum ativo {market_label} aberto encontrado. "
-            "Verifique o horário de mercado ou o arquivo favoritos.txt."
+            f"⚠️  Nenhum ativo {market_label} disponível em M5 agora. "
+            "O bot vai aguardar e tentar a cada ciclo conforme os mercados abrirem."
         )
-        sys.exit(1)
 
     # Inicializar paths de log com tag automática
     market_tag = "otc" if use_otc else "op"
-    auto_tag = f"m5_{market_tag}_{len(ativos_lista)}ativos"
+    auto_tag = f"m5_{market_tag}_{max_ativos}ativos"
     _init_paths_with_tag(auto_tag)
     _ensure_csv_headers()
 
@@ -2526,7 +2636,12 @@ if __name__ == '__main__':
     print('\n🚀 Iniciando...\n')
 
     try:
-        loop_patterns_multi(ativos_lista, tf_min=TIMEFRAME_MINUTES)
+        loop_patterns_multi(
+            ativos_lista,
+            tf_min=TIMEFRAME_MINUTES,
+            max_ativos=max_ativos,
+            use_otc=use_otc,
+        )
     except KeyboardInterrupt:
         print("\nInterrompido pelo usuário.")
     except Exception as e:
