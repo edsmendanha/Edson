@@ -17,7 +17,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from configobj import ConfigObj
 from iqoptionapi.stable_api import IQ_Option
 
-BOTDIN_VERSION = "2026-03-24-v15.1-m5-extremefilter-reversalonly"
+BOTDIN_VERSION = "2026-03-25-m5-minimal-multiativo"
 
 # =========================
 # CONFIG
@@ -54,6 +54,7 @@ LOG_DIR = BASE_DIR / 'logs'
 STATE_DIR = BASE_DIR / 'state'
 PRESETS_DIR = BASE_DIR / 'presets'
 STATE_PATH = STATE_DIR / 'bot_state.json'
+FAVORITES_FILE = BASE_DIR / 'favoritos.txt'
 
 INSTANCE_TAG = "unset"
 
@@ -1537,6 +1538,120 @@ def ask_yes_no(prompt):
             return r == 's'
 
 
+# =========================
+# FAVORITOS / LISTA DE ATIVOS
+# =========================
+def load_favorites() -> List[str]:
+    """Lê favoritos.txt (um ativo por linha). Linhas com # são comentários."""
+    favs: List[str] = []
+    try:
+        if FAVORITES_FILE.exists():
+            with FAVORITES_FILE.open('r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    favs.append(_normalize_asset_name(line))
+    except Exception:
+        pass
+    return favs
+
+
+def build_asset_list(use_otc: bool, max_count: int) -> List[Tuple[str, str]]:
+    """Monta lista de (ativo, categoria) priorizando favoritos.txt.
+
+    1. Lê favoritos.txt — usa os que estão abertos e correspondem ao tipo.
+    2. Completa com outros ativos abertos do tipo até max_count.
+    """
+    try:
+        ot = API.get_all_open_time()
+    except Exception:
+        return []
+
+    # Todos os ativos abertos do tipo escolhido (sem duplicatas de nome)
+    open_assets: List[Tuple[str, str]] = []
+    seen: set = set()
+    for categoria in _categories_priority(tipo):
+        table = ot.get(categoria, {})
+        if not isinstance(table, dict):
+            continue
+        for name, info in table.items():
+            if not (isinstance(info, dict) and info.get('open')):
+                continue
+            name_u = str(name).upper()
+            if name_u in seen:
+                continue
+            if use_otc:
+                if '-OTC' in name_u:
+                    open_assets.append((name, categoria))
+                    seen.add(name_u)
+            else:
+                if '-OP' in name_u:
+                    open_assets.append((name, categoria))
+                    seen.add(name_u)
+
+    # Mapa nome normalizado -> (name, categoria) para lookup rápido
+    open_map: Dict[str, Tuple[str, str]] = {
+        _normalize_asset_name(n): (n, c) for n, c in open_assets
+    }
+
+    favs = load_favorites()
+    result: List[Tuple[str, str]] = []
+    used: set = set()
+
+    # 1ª passagem: favoritos abertos (na ordem do arquivo)
+    for fav in favs:
+        if len(result) >= max_count:
+            break
+        entry = open_map.get(fav)
+        if entry and entry[0].upper() not in used:
+            result.append(entry)
+            used.add(entry[0].upper())
+
+    # 2ª passagem: completa com outros abertos do tipo
+    for name, cat in open_assets:
+        if len(result) >= max_count:
+            break
+        if name.upper() not in used:
+            result.append((name, cat))
+            used.add(name.upper())
+
+    return result
+
+
+def ask_market_type() -> bool:
+    """Pergunta tipo de mercado. Retorna True para OTC, False para Mercado Aberto (-OP)."""
+    print("\n" + "=" * 70)
+    print("🌍 TIPO DE MERCADO")
+    print("=" * 70)
+    print("  1) Mercado Aberto  (ativos -OP)")
+    print("  2) OTC")
+    while True:
+        r = input("\n👉 Digite 1 ou 2 [1]: ").strip() or "1"
+        if r == "1":
+            return False
+        if r == "2":
+            return True
+        print("❌ Opção inválida!")
+
+
+def ask_num_assets() -> int:
+    """Pergunta quantos ativos operar simultaneamente (1 a 8)."""
+    print("\n" + "=" * 70)
+    print("📊 NÚMERO DE ATIVOS SIMULTÂNEOS")
+    print("=" * 70)
+    print("  Escolha quantos ativos operar ao mesmo tempo (1 a 8).")
+    while True:
+        r = input("\n👉 Digite um número de 1 a 8 [4]: ").strip() or "4"
+        try:
+            n = int(r)
+            if 1 <= n <= 8:
+                return n
+        except Exception:
+            pass
+        print("❌ Digite um número entre 1 e 8.")
+
+
 def ask_time_hhmm(prompt):
     while True:
         raw = input(prompt + " (HH:MM): ").strip()
@@ -2086,6 +2201,247 @@ def loop_patterns(ativo: str, ativo_chave: str, tf_min: int, runtime_seconds: Op
 
 
 # =========================
+# LOOP MULTI-ATIVO (M5)
+# =========================
+def loop_patterns_multi(ativos: List[Tuple[str, str]], tf_min: int):
+    """Orquestra múltiplos ativos em único ciclo (M5). Stops globais pelo saldo."""
+
+    period = tf_min * 60
+    expiration = tf_min  # M5 -> expiração 5 min
+
+    # Estado por ativo
+    per_asset_pending: Dict[str, Optional[Dict[str, Any]]] = {a: None for a, _ in ativos}
+    per_asset_pending_id: Dict[str, Any] = {a: None for a, _ in ativos}
+    per_asset_lock_until: Dict[str, int] = {a: 0 for a, _ in ativos}
+    per_asset_last_idle_cid: Dict[str, Any] = {a: None for a, _ in ativos}
+    per_asset_last_pend_status_id: Dict[str, Any] = {a: None for a, _ in ativos}
+    asset_last_pending_print: Dict[Any, float] = {}
+
+    initial_bal = get_available_balance()
+    stop_loss_threshold = None
+    stop_win_threshold = None
+    if initial_bal:
+        if STOP_LOSS_PCT > 0:
+            stop_loss_threshold = initial_bal * (1.0 - STOP_LOSS_PCT / 100.0)
+        if STOP_WIN_PCT > 0:
+            stop_win_threshold = initial_bal * (1.0 + STOP_WIN_PCT / 100.0)
+
+    console_event(
+        f"🚀 Loop M{tf_min} multi-ativo | {len(ativos)} ativo(s) | "
+        f"Modo: REVERSÃO | tag={INSTANCE_TAG}"
+    )
+    for a, ak in ativos:
+        console_event(f"  📊 {display_asset_name(a)} ({ak})")
+
+    while True:
+        # Verificação global de stop
+        bal = get_available_balance()
+        if stop_loss_threshold and bal is not None and bal <= stop_loss_threshold:
+            console_event("🛑 STOP LOSS global atingido. Encerrando ciclo...")
+            break
+        if stop_win_threshold and bal is not None and bal >= stop_win_threshold:
+            console_event("🎯 STOP WIN global atingido. Encerrando ciclo...")
+            break
+
+        now_server = int(API.get_server_timestamp())
+        candle_id = now_server // period
+
+        for ativo, ativo_chave in ativos:
+            pend = per_asset_pending[ativo]
+            pend_id = per_asset_pending_id[ativo]
+            lock_until = per_asset_lock_until[ativo]
+
+            if pend is None and candle_id != per_asset_last_idle_cid[ativo]:
+                per_asset_last_idle_cid[ativo] = candle_id
+                console_event(f"⏳ Aguardando... (Ativo: {display_asset_name(ativo)} | TF: M{tf_min})")
+
+            if not ativo_aberto(ativo, chave_preferida=ativo_chave):
+                _log_blocked("asset_closed", f"ativo={ativo} tf={tf_min}")
+                continue
+
+            velas = get_candles_safe(ativo, period, CANDLES_LOOKBACK)
+            if not velas or len(velas) < MIN_CANDLES_REQUIRED:
+                continue
+
+            if not passes_atr_filter(tf_min, velas) or not passes_trend_strength_filter(tf_min, velas):
+                continue
+
+            if pend is not None and pend_id is not None:
+                if per_asset_last_pend_status_id[ativo] != pend_id:
+                    per_asset_last_pend_status_id[ativo] = pend_id
+                    console_event(
+                        f"🕯️ [{display_asset_name(ativo)}] {pend['pattern_name']} pendente "
+                        f"(aguardando confirmação)"
+                    )
+
+                status, direction = confirm_pending(tf_min, pend, velas)
+
+                if status == "waiting":
+                    continue
+
+                if status in ("expired", "rejected", "error"):
+                    per_asset_pending[ativo] = None
+                    per_asset_pending_id[ativo] = None
+                    per_asset_lock_until[ativo] = now_server + period
+                    continue
+
+                if status == "confirmed" and direction in ("call", "put"):
+                    patt = pend["pattern_name"]
+
+                    ok_win, sec, win = within_entry_window(tf_min)
+                    if not ok_win:
+                        _log_blocked("missed_early_entry", f"ativo={ativo} tf={tf_min}")
+                        per_asset_pending[ativo] = None
+                        per_asset_pending_id[ativo] = None
+                        per_asset_lock_until[ativo] = now_server + period
+                        continue
+
+                    if BUY_LATENCY_AVG + BUY_LATENCY_MARGIN >= (win - sec):
+                        _log_blocked("latency_guard", f"ativo={ativo} tf={tf_min}")
+                        per_asset_pending[ativo] = None
+                        per_asset_pending_id[ativo] = None
+                        per_asset_lock_until[ativo] = now_server + period
+                        continue
+
+                    if not can_purchase_now(ativo, period_minutes=tf_min, chave_preferida=ativo_chave):
+                        _log_blocked("purchase_buffer", f"ativo={ativo} tf={tf_min}")
+                        per_asset_pending[ativo] = None
+                        per_asset_pending_id[ativo] = None
+                        per_asset_lock_until[ativo] = now_server + period
+                        continue
+
+                    saldo_before = get_available_balance() or 0.0
+                    amount_to_use = compute_amount(saldo_before)
+                    secs_left = seconds_left_in_period(tf_min)
+
+                    console_event(
+                        f"🕯️ [{server_hhmmss()}] [{display_asset_name(ativo)}] Sinal confirmado: {patt} | "
+                        f"Entrada: {direction.upper()} | ${amount_to_use:.2f} | secs_left={secs_left}"
+                    )
+
+                    result_container: Dict[str, Any] = {}
+                    ev = threading.Event()
+                    if USE_BUY_THREAD:
+                        t = threading.Thread(
+                            target=_buy_worker,
+                            args=(direction, ativo, amount_to_use, expiration, result_container, ev),
+                            daemon=True
+                        )
+                        t.start()
+                        ev.wait(timeout=25.0)
+                    else:
+                        status_b, info_b = _do_buy_minimal(amount_to_use, ativo, direction, expiration)
+                        result_container["res"] = {
+                            "success": bool(status_b),
+                            "order_id": info_b if status_b else None,
+                            "info": info_b,
+                        }
+
+                    res = result_container.get("res", {})
+                    if not res.get("success"):
+                        console_event(
+                            f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] Falha ao enviar ordem."
+                        )
+                        per_asset_pending[ativo] = None
+                        per_asset_pending_id[ativo] = None
+                        per_asset_lock_until[ativo] = now_server + period
+                        continue
+
+                    order_id = res.get("order_id")
+                    console_event(
+                        f"✅ [{server_hhmmss()}] [{display_asset_name(ativo)}] Ordem aceita | ID: {order_id}"
+                    )
+                    console_event(
+                        f"⏳ [{server_hhmmss()}] [{display_asset_name(ativo)}] Aguardando resultado..."
+                    )
+
+                    t0 = time.time()
+                    min_wait = expiration * 60 + RESULT_DELAY_AFTER_EXPIRY_SECONDS
+                    while time.time() - t0 < min_wait:
+                        time.sleep(0.5)
+
+                    timeout = M5_RESULT_TIMEOUT if expiration == 5 else M1_RESULT_TIMEOUT
+                    timeout = max(35, timeout)
+
+                    result = check_order_result(
+                        order_id, amount_to_use,
+                        saldo_before=saldo_before,
+                        timeout_seconds=timeout,
+                        poll_interval=2.0,
+                    )
+
+                    label = result.get("result", "unknown")
+                    profit = result.get("profit")
+                    bal_after = result.get("balance_after")
+                    method = result.get("method")
+
+                    if label == "win":
+                        console_event(
+                            f"✅ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
+                            f"{fmt_result_line(label, profit, method)}"
+                        )
+                    elif label == "loss":
+                        console_event(
+                            f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
+                            f"{fmt_result_line(label, profit, method)}"
+                        )
+                    else:
+                        console_event(
+                            f"❓ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
+                            f"{fmt_result_line(label, profit, method)}"
+                        )
+
+                    try:
+                        if TRADES_CSV is not None:
+                            with TRADES_CSV.open('a', newline='', encoding='utf-8') as f:
+                                csv.writer(f).writerow([
+                                    now_iso(), INSTANCE_TAG,
+                                    ativo, tf_min, ENTRY_MODE, RIGIDEZ_MODE,
+                                    direction, order_id,
+                                    method, label, float(profit) if profit is not None else "",
+                                    saldo_before, bal_after if bal_after is not None else "",
+                                    amount_to_use, f"{BUY_LATENCY_AVG:.6f}",
+                                    patt, pend.get("pattern_from"),
+                                    secs_left,
+                                ])
+                    except Exception:
+                        pass
+
+                    per_asset_pending[ativo] = None
+                    per_asset_pending_id[ativo] = None
+                    per_asset_lock_until[ativo] = now_server + period
+                    continue
+
+            if now_server < lock_until:
+                continue
+
+            sig = check_patterns(tf_min, velas)
+            if not sig:
+                continue
+
+            patt = sig["pattern_name"]
+            patt_from = int(sig["pattern_from"])
+            new_pend_id = (patt, patt_from, ativo, tf_min)
+
+            last_p = asset_last_pending_print.get(new_pend_id, 0.0)
+            nowt = time.time()
+            if nowt - last_p >= PENDING_PRINT_THROTTLE_S:
+                console_event(
+                    f"🕯️ [{display_asset_name(ativo)}] Sinal detectado: {patt}. "
+                    f"Aguardando confirmação..."
+                )
+                asset_last_pending_print[new_pend_id] = nowt
+
+            per_asset_pending[ativo] = sig
+            per_asset_pending_id[ativo] = new_pend_id
+            per_asset_lock_until[ativo] = int(sig["expected_confirm_from"]) + period
+
+        time.sleep(IDLE_SLEEP_S_M5)
+
+    print("✅ Loop multi-ativo finalizado.")
+
+
+# =========================
 # MAIN
 # =========================
 if __name__ == '__main__':
@@ -2095,6 +2451,11 @@ if __name__ == '__main__':
 
     connect()
 
+    print("\n" + "=" * 70)
+    print(f"🤖 BOT DINVELAS M5  |  v{BOTDIN_VERSION}")
+    print("=" * 70)
+
+    # Conta
     print("\n" + "=" * 70)
     print("💼 CONTA")
     print("=" * 70)
@@ -2107,74 +2468,40 @@ if __name__ == '__main__':
     API.change_balance(conta)
     print(f"✅ Conta selecionada: {'DEMO' if conta == 'PRACTICE' else 'REAL'}")
 
-    print("\n" + "=" * 70)
-    print("📊 TIPO (BINÁRIA / DIGITAL)")
-    print("=" * 70)
-    print("\nEscolha o tipo de operação:")
-    print("  1) Binárias")
-    print("  2) Digitais")
-    print("  ENTER = automático")
-    while True:
-        r = input(f"\n👉 Digite 1, 2 ou ENTER [padrão: {tipo_default}]: ").strip()
-        if r == '':
-            tipo = 'digital' if 'digital' in tipo_default else 'binary'
-            print(f"✅ Seleção automática: {tipo.upper()}")
-            break
-        if r == '1':
-            tipo = 'binary'
-            print("✅ Binárias selecionadas")
-            break
-        if r == '2':
-            tipo = 'digital'
-            print("✅ Digitais selecionadas")
-            break
-        print("❌ Opção inválida!")
+    # Tipo de mercado
+    use_otc = ask_market_type()
+    market_label = "OTC" if use_otc else "Mercado Aberto"
 
-    TIMEFRAME_MINUTES = ask_timeframe()
-    ENTRY_MODE = ask_entry_mode()
-    RIGIDEZ_MODE = ask_rigidez()
-    _apply_rigidez()
+    # Número de ativos simultâneos
+    max_ativos = ask_num_assets()
 
-    print("\n" + "=" * 70)
-    print("🕐 AGENDAR INÍCIO")
-    print("=" * 70)
-    agendar = ask_yes_no("\n👉 Deseja programar o início das operações?")
-    start_ts = None
-    if agendar:
-        hh, mm = ask_time_hhmm("👉 Horário (HH:MM formato 24h)")
-        now = datetime.now()
-        target = datetime(year=now.year, month=now.month, day=now.day, hour=hh, minute=mm, second=0)
-        if target <= now:
-            target = target + timedelta(days=1)
-        start_ts = int(target.timestamp())
-        start_ts = round_up_to_next_period(start_ts, TIMEFRAME_MINUTES)
-        print(f"✅ Agendado para: {datetime.fromtimestamp(start_ts).strftime('%d/%m/%Y %H:%M:%S')}")
-
-    print("\n" + "=" * 70)
-    print("⏲️ TEMPO DE EXECUÇÃO")
-    print("=" * 70)
-    while True:
-        raw = input("\n👉 Minutos de operação [0 = ilimitado]: ").strip()
-        try:
-            minutos_runtime = int(raw)
-            if minutos_runtime >= 0:
-                break
-        except Exception:
-            pass
-        print("❌ Digite um número válido (ex: 60) ou 0")
-    runtime_seconds = None if minutos_runtime == 0 else minutos_runtime * 60
-
-    print("\n" + "=" * 70)
-    print("💱 ATIVO")
-    print("=" * 70)
-    ATIVO, ATIVO_CHAVE, schedule_meta = choose_asset_interactive(start_ts=start_ts)
-
-    ask_amount_menu()
+    # Stops
     ask_stop_loss_win()
 
-    if PRESET_PATH is not None:
-        preset = build_preset_dict(ativo=ATIVO, ativo_chave=ATIVO_CHAVE, runtime_min=minutos_runtime)
-        write_preset_file(PRESET_PATH, preset)
+    # Valor por operação
+    ask_amount_menu()
+
+    # Configurações fixas para esta versão
+    TIMEFRAME_MINUTES = 5
+    ENTRY_MODE = "reversal"
+    RIGIDEZ_MODE = "normal"
+    _apply_rigidez()
+
+    # Montar lista de ativos
+    print(f"\n🔍 Buscando ativos {market_label} disponíveis...")
+    ativos_lista = build_asset_list(use_otc=use_otc, max_count=max_ativos)
+    if not ativos_lista:
+        print(
+            f"❌ Nenhum ativo {market_label} aberto encontrado. "
+            "Verifique o horário de mercado ou o arquivo favoritos.txt."
+        )
+        sys.exit(1)
+
+    # Inicializar paths de log com tag automática
+    market_tag = "otc" if use_otc else "op"
+    auto_tag = f"m5_{market_tag}_{len(ativos_lista)}ativos"
+    _init_paths_with_tag(auto_tag)
+    _ensure_csv_headers()
 
     nome = get_profile_name()
 
@@ -2184,28 +2511,22 @@ if __name__ == '__main__':
     if nome:
         print(f'👤 Usuário: {nome}')
     print(f'InstanceTag: {INSTANCE_TAG}')
-    print(f'Conta: {"DEMO" if conta == "PRACTICE" else "REAL"} | Tipo: {tipo.upper()}')
-    print(f'Ativo: {display_asset_name(ATIVO)} ({ATIVO_CHAVE}) | Timeframe: M{TIMEFRAME_MINUTES} | Exp: {1 if TIMEFRAME_MINUTES == 1 else 5}')
-    if start_ts is not None:
-        print(f'Início agendado: {datetime.fromtimestamp(start_ts).strftime("%d/%m/%Y %H:%M:%S")} (resolve -OP automático, timeout 30min)')
+    print(f'Conta: {"DEMO" if conta == "PRACTICE" else "REAL"} | Mercado: {market_label}')
+    print(f'Timeframe: M5 | Modo: REVERSÃO | Ativos: {len(ativos_lista)}/{max_ativos}')
+    print('Ativos selecionados:')
+    for a, ak in ativos_lista:
+        print(f'  - {display_asset_name(a)} ({ak})')
+    if AMOUNT_MODE == "fixed":
+        print(f'Valor por operação: ${AMOUNT_FIXED:.2f} (fixo)')
     else:
-        print('Início: imediato (exige ativo aberto)')
-    print(f'Valor: ${AMOUNT_FIXED:.2f}' if AMOUNT_MODE == "fixed" else f'Valor: {AMOUNT_PERCENT:.2f}%')
+        print(f'Valor por operação: {AMOUNT_PERCENT:.2f}% do saldo')
     print(f'StopLoss: {STOP_LOSS_PCT:.2f}% | StopWin: {STOP_WIN_PCT:.2f}%')
-    if PRESET_PATH is not None:
-        print(f'Preset: {PRESET_PATH.as_posix()}')
     print(f'Logs: {LOG_DIR.as_posix()}/ | State: {STATE_DIR.as_posix()}/')
     print('=' * 70)
     print('\n🚀 Iniciando...\n')
 
     try:
-        loop_patterns(
-            ATIVO, ATIVO_CHAVE, TIMEFRAME_MINUTES,
-            runtime_seconds=runtime_seconds,
-            start_timestamp=start_ts,
-            schedule_base=schedule_meta.get("base", ATIVO),
-            schedule_allow_otc=bool(schedule_meta.get("allow_otc", False)),
-        )
+        loop_patterns_multi(ativos_lista, tf_min=TIMEFRAME_MINUTES)
     except KeyboardInterrupt:
         print("\nInterrompido pelo usuário.")
     except Exception as e:

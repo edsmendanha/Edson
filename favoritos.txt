@@ -1,0 +1,13 @@
+# Arquivo de ativos favoritos — um por linha.
+# Linhas começando com # são comentários e serão ignoradas.
+# O bot prioriza esses ativos. Se menos do que o limite estiverem
+# abertos, completa automaticamente com outros do tipo escolhido.
+#
+# Exemplos (descomente para ativar):
+# EURUSD-OP
+# EURJPY-OP
+# GBPUSD-OP
+# AUDUSD-OP
+# USDJPY-OP
+# EURUSD-OTC
+# EURJPY-OTC
