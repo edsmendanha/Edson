@@ -1565,19 +1565,18 @@ def build_asset_list(use_otc: bool, max_count: int) -> List[Tuple[str, str]]:
 
     1. Lê favoritos.txt — usa os que estão abertos e correspondem ao tipo.
     2. Completa com outros ativos abertos do tipo até max_count.
+    Apenas ativos da categoria 'binary' são considerados (digitais são ignorados).
     """
     try:
         ot = API.get_all_open_time()
     except Exception:
         return []
 
-    # Todos os ativos abertos do tipo escolhido (sem duplicatas de nome)
+    # Apenas ativos binários (ignora digital e turbo)
     open_assets: List[Tuple[str, str]] = []
     seen: set = set()
-    for categoria in _categories_priority(tipo):
-        table = ot.get(categoria, {})
-        if not isinstance(table, dict):
-            continue
+    table = ot.get('binary', {})
+    if isinstance(table, dict):
         for name, info in table.items():
             if not (isinstance(info, dict) and info.get('open')):
                 continue
@@ -1586,11 +1585,11 @@ def build_asset_list(use_otc: bool, max_count: int) -> List[Tuple[str, str]]:
                 continue
             if use_otc:
                 if '-OTC' in name_u:
-                    open_assets.append((name, categoria))
+                    open_assets.append((name, 'binary'))
                     seen.add(name_u)
             else:
                 if '-OP' in name_u:
-                    open_assets.append((name, categoria))
+                    open_assets.append((name, 'binary'))
                     seen.add(name_u)
 
     # Mapa nome normalizado -> (name, categoria) para lookup rápido
@@ -1806,6 +1805,24 @@ def ask_stop_loss_win():
         except Exception:
             pass
         print("❌ Valor inválido")
+
+
+def ask_run_duration() -> int:
+    """Pergunta por quantos minutos o bot deve rodar (0 = ilimitado)."""
+    print("\n" + "=" * 70)
+    print("⏱️  TEMPORIZADOR DE FINALIZAÇÃO")
+    print("=" * 70)
+    print("  Defina por quantos minutos o bot deve operar.")
+    print("  0 = sem limite (bot roda até ser interrompido manualmente).")
+    while True:
+        raw = input("\n👉 Minutos de operação (0 = ilimitado) [0]: ").strip() or "0"
+        try:
+            v = int(raw)
+            if v >= 0:
+                return v
+        except Exception:
+            pass
+        print("❌ Digite um número inteiro >= 0.")
 
 
 # =========================
@@ -2220,6 +2237,7 @@ def loop_patterns_multi(
     tf_min: int,
     max_ativos: int = 0,
     use_otc: bool = False,
+    run_minutes: int = 0,
 ):
     """Orquestra múltiplos ativos em único ciclo (M5). Stops globais pelo saldo.
 
@@ -2229,11 +2247,15 @@ def loop_patterns_multi(
     - A cada novo candle, re-verifica o pool completo (favoritos + book) e
       re-inclui qualquer ativo que agora aceite M5 (sem ban permanente).
     - Se não houver ativos disponíveis, aguarda e continua tentando a cada ciclo.
+    - run_minutes > 0: encerra automaticamente após esse número de minutos.
     """
 
     period = tf_min * 60
     expiration = tf_min  # M5 -> expiração 5 min
     _max_ativos = max_ativos if max_ativos > 0 else len(ativos)
+
+    # Temporizador de finalização automática
+    end_time: Optional[float] = (time.time() + run_minutes * 60) if run_minutes > 0 else None
 
     # Lista mutável de ativos ativos
     active_ativos: List[Tuple[str, str]] = list(ativos)
@@ -2340,6 +2362,14 @@ def loop_patterns_multi(
             break
         if stop_win_threshold and bal is not None and bal >= stop_win_threshold:
             console_event("🎯 STOP WIN global atingido. Encerrando ciclo...")
+            break
+
+        # Verificação de temporizador automático
+        if end_time is not None and time.time() >= end_time:
+            console_event(
+                f"⏹️  Tempo de operação encerrado ({run_minutes} min). "
+                "Bot finalizado automaticamente."
+            )
             break
 
         now_server = int(API.get_server_timestamp())
@@ -2592,6 +2622,9 @@ if __name__ == '__main__':
     # Valor por operação
     ask_amount_menu()
 
+    # Temporizador de finalização automática
+    run_minutes = ask_run_duration()
+
     # Configurações fixas para esta versão
     TIMEFRAME_MINUTES = 5
     ENTRY_MODE = "reversal"
@@ -2631,6 +2664,8 @@ if __name__ == '__main__':
     else:
         print(f'Valor por operação: {AMOUNT_PERCENT:.2f}% do saldo')
     print(f'StopLoss: {STOP_LOSS_PCT:.2f}% | StopWin: {STOP_WIN_PCT:.2f}%')
+    timer_label = f"{run_minutes} min" if run_minutes > 0 else "ilimitado"
+    print(f'Temporizador: {timer_label} | Tipo: somente binary')
     print(f'Logs: {LOG_DIR.as_posix()}/ | State: {STATE_DIR.as_posix()}/')
     print('=' * 70)
     print('\n🚀 Iniciando...\n')
@@ -2641,6 +2676,7 @@ if __name__ == '__main__':
             tf_min=TIMEFRAME_MINUTES,
             max_ativos=max_ativos,
             use_otc=use_otc,
+            run_minutes=run_minutes,
         )
     except KeyboardInterrupt:
         print("\nInterrompido pelo usuário.")
