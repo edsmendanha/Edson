@@ -17,7 +17,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from configobj import ConfigObj
 from iqoptionapi.stable_api import IQ_Option
 
-BOTDIN_VERSION = "2026-03-23-v14.4-scheduled-resolve-open-variant-caseinsensitive-op"
+BOTDIN_VERSION = "2026-03-24-v15.1-m5-extremefilter"
 
 # =========================
 # CONFIG
@@ -827,6 +827,57 @@ V15_IMPULSE_MULTIPLIER = 8000  # Fator de escala: impulso*fator → pontos (capa
 V15_WICK_SCORE_MAX = 25        # Pontuação máxima por componente wick
 V15_WICK_SCORE_FACTOR = 35     # Fator multiplicador: wick_ratio*fator → pontos brutos
 
+# =========================
+# FILTRO ESTRUTURAL M5 (v15.1)
+# Aplicado exclusivamente no timeframe M5 para sinais V15.
+# Garante que a vela candidata esteja próxima do extremo recente,
+# evitando reversões "no meio do range" (zonas ruidosas).
+# Para ajuste futuro: altere M5_EXTREME_CANDLES (janela) e
+# M5_EXTREME_FRAC (tolerância — 0.20 = 20% mais baixos/altos).
+# =========================
+M5_EXTREME_CANDLES = 20   # Quantidade de velas retroativas para definir o range estrutural
+M5_EXTREME_FRAC    = 0.20 # Fração do range aceita como "extremo" (20% → tolerância razoável)
+
+
+def _m5_extreme_filter(direction: str, velas: List[Dict[str, Any]]) -> bool:
+    """
+    Filtro de localização estrutural exclusivo do M5 (v15.1).
+
+    Verifica se o fechamento da vela candidata (penúltima da lista)
+    está no extremo do range das últimas M5_EXTREME_CANDLES velas:
+      - CALL: close nos 20% mais BAIXOS do range  → tende a reversão de alta
+      - PUT : close nos 20% mais ALTOS  do range  → tende a reversão de baixa
+
+    A tolerância de 20% foi escolhida deliberadamente para NÃO endurecer
+    demais o critério no M5 (que já é seletivo por natureza).
+    Retorna True se o sinal PASSA o filtro, False se deve ser rejeitado.
+    Para ajustar a rigidez: aumente M5_EXTREME_FRAC (mais permissivo)
+    ou diminua (mais restritivo).
+    """
+    # Garante janela suficiente; se não houver velas bastantes, não bloqueia
+    window = velas[-(M5_EXTREME_CANDLES + 2):-1]  # inclui candidata e N anteriores
+    if len(window) < 3:
+        return True
+
+    highs  = [float(v.get("max", v.get("high", v.get("close", 0)))) for v in window]
+    lows   = [float(v.get("min", v.get("low",  v.get("close", 0)))) for v in window]
+    range_high = max(highs)
+    range_low  = min(lows)
+    range_size = range_high - range_low
+
+    if range_size < 1e-10:
+        return True  # range degenerado → não bloqueia
+
+    candidate_close = float(window[-1].get("close", 0))
+    threshold = range_size * M5_EXTREME_FRAC
+
+    if direction == "call":
+        # Aceita se fechamento está nos M5_EXTREME_FRAC mais baixos do range
+        return candidate_close <= range_low + threshold
+    else:  # put
+        # Aceita se fechamento está nos M5_EXTREME_FRAC mais altos do range
+        return candidate_close >= range_high - threshold
+
 
 def _v15_rsi(closes: List[float], period: int = 14) -> Optional[float]:
     """Calcula RSI (Relative Strength Index) com suavização Wilder."""
@@ -1017,6 +1068,11 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
 
     # ── Disparo do sinal V15 ───────────────────────────────────────────────
     if call_score >= V15_SCORE_MIN and call_score > put_score:
+        # ── Filtro estrutural M5 (v15.1): só aceita sinal no extremo do range ──
+        # Aplicado exclusivamente no M5 para evitar reversão no meio do range.
+        # Demais timeframes (M1 etc.) passam direto sem este filtro.
+        if tf_min == 5 and not _m5_extreme_filter("call", velas):
+            return None
         return {
             "pattern_name": "ReversalV15_CALL",
             "direction_hint": "call",
@@ -1028,6 +1084,9 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
             "pattern_mode": "v15",
         }
     if put_score >= V15_SCORE_MIN and put_score > call_score:
+        # ── Filtro estrutural M5 (v15.1): só aceita sinal no extremo do range ──
+        if tf_min == 5 and not _m5_extreme_filter("put", velas):
+            return None
         return {
             "pattern_name": "ReversalV15_PUT",
             "direction_hint": "put",
