@@ -60,7 +60,7 @@ O bot exibe um menu interativo completo ao iniciar.
 - Se o mercado digital estiver fechado, cai automaticamente para **BINÁRIA**.  
 - **Antes de cada entrada**, o status digital/binária é re-verificado via API (sem cache).  
 - Se a digital reabrir durante a sessão, o bot volta a usá-la automaticamente.  
-- Usa `API.buy_digital_spot()` para digital e `API.buy()` para binária.  
+- Usa `API.buy_digital_spot_v2()` para digital e `API.buy()` para binária.  
 - Se a ordem digital falhar, tenta fallback para binária automaticamente.  
 - Controlado pelo flag global `PREFER_DIGITAL = True`.
 
@@ -196,4 +196,4 @@ GBPUSD-OP
 
 ## Versão
 
-`2026-03-25-m1m5-digital-maxentries`
+`2026-03-25-m1m5-digital-v2`

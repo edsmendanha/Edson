@@ -17,7 +17,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from configobj import ConfigObj
 from iqoptionapi.stable_api import IQ_Option
 
-BOTDIN_VERSION = "2026-03-25-m1m5-digital-maxentries"
+BOTDIN_VERSION = "2026-03-25-m1m5-digital-v2"
 
 # =========================
 # CONFIG
@@ -1529,11 +1529,11 @@ def resolve_trade_variant(ativo: str, ativo_chave: str) -> Tuple[str, str]:
 
 
 def _do_buy_minimal(amount, ativo, direction, expiration, ativo_chave: str = 'binary'):
-    """Executa compra usando digital (buy_digital_spot) ou binária (buy) conforme ativo_chave."""
+    """Executa compra usando digital (buy_digital_spot_v2) ou binária (buy) conforme ativo_chave."""
     t0 = time.perf_counter()
     try:
         if ativo_chave == 'digital' and PREFER_DIGITAL:
-            status, info = API.buy_digital_spot(ativo, amount, direction, expiration)
+            status, info = API.buy_digital_spot_v2(ativo, amount, direction, expiration)
         else:
             status, info = API.buy(amount, ativo, direction, expiration)
     except Exception as e:
@@ -2346,7 +2346,7 @@ def loop_patterns_multi(
 
     Prioridade Digital:
     - Antes de cada entrada, resolve_trade_variant() re-verifica se o mercado
-      DIGITAL está aberto para o ativo. Se sim, usa buy_digital_spot(). Se não,
+      DIGITAL está aberto para o ativo. Se sim, usa buy_digital_spot_v2(). Se não,
       usa buy() (binária). Assim o bot sempre prioriza digital e cai para binária.
     """
 
