@@ -17,7 +17,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from configobj import ConfigObj
 from iqoptionapi.stable_api import IQ_Option
 
-BOTDIN_VERSION = "2026-03-25-m5-dynrecheck"
+BOTDIN_VERSION = "2026-03-25-m1m5-digital-maxentries"
 
 # =========================
 # CONFIG
@@ -103,6 +103,9 @@ API = None
 conta = None  # PRACTICE/REAL
 tipo = tipo_default  # binary/digital
 
+# Prioridade DIGITAL: True = tenta digital primeiro; cai para binária se fechada
+PREFER_DIGITAL = True
+
 PURCHASE_BUFFER_SECONDS = int(config.get('AJUSTES', {}).get('purchase_buffer_seconds', 8))
 
 USE_BUY_THREAD = True
@@ -155,6 +158,9 @@ AMOUNT_MIN = 0.01
 STOP_LOSS_PCT = 0.0
 STOP_WIN_PCT = 0.0
 
+# Máximo de entradas aceitas (0 = ilimitado). Bot para ao atingir esse total.
+MAX_ENTRIES = 0
+
 BLOCKED_COUNTERS = defaultdict(int)
 
 pending: Optional[Dict[str, Any]] = None
@@ -203,7 +209,8 @@ def _ensure_csv_headers():
                 'balance_before', 'balance_after',
                 'amount_used', 'buy_latency_avg_s',
                 'pattern_name', 'pattern_from',
-                'secs_left_at_buy'
+                'secs_left_at_buy',
+                'trade_ativo', 'market_type',
             ])
     if not PATTERNS_CSV.exists():
         with PATTERNS_CSV.open('w', newline='', encoding='utf-8') as f:
@@ -812,7 +819,8 @@ def is_harami_bullish(prev_c, cur_c) -> bool:
 # =========================
 
 # --- Parâmetros fixos do motor V15 (bloco centralizado, não dispersar) ---
-V15_SCORE_MIN = 80           # Score mínimo para sinal reversal V15 (0–100)
+# Nota rigidez: M5 normal=80 | M5 rígida≈82 | M1 normal≈80 | M1 extra-rígida=90
+V15_SCORE_MIN = 80           # Score mínimo para sinal reversal V15 (0–100); ajustado por _apply_rigidez()
 V15_CONFIRM_POLLS = 3        # Polls consecutivos de confirmação sustentada necessários
 V15_RSI_PERIOD = 14          # Período RSI
 V15_RSI_OVERSOLD = 30        # RSI abaixo deste valor = oversold → sinal call
@@ -1484,10 +1492,50 @@ def check_order_result(order_id, amount, saldo_before=None, timeout_seconds=90, 
 # =========================
 # Buy
 # =========================
-def _do_buy_minimal(amount, ativo, direction, expiration):
+def resolve_trade_variant(ativo: str, ativo_chave: str) -> Tuple[str, str]:
+    """Antes de cada entrada, re-verifica qual mercado usar.
+
+    PRIORIZA DIGITAL: verifica se existe variante digital aberta para o ativo.
+    Se digital estiver aberto → retorna (nome_digital, 'digital').
+    Se digital estiver fechado → retorna a variante binária/original.
+    Chama a API a cada invocação (não usa cache) para garantir status atualizado.
+    """
+    if not PREFER_DIGITAL:
+        return ativo, ativo_chave
+    try:
+        ot = API.get_all_open_time()
+        # Normalizar base do ativo (strip -OP / -OTC)
+        base = _normalize_asset_name(re.sub(r'[-]?(OTC|OP)$', '', ativo.upper()))
+        # Tentar digital primeiro
+        digital_table = ot.get('digital', {})
+        if isinstance(digital_table, dict):
+            for name, info in digital_table.items():
+                if not (isinstance(info, dict) and info.get('open')):
+                    continue
+                name_norm = _normalize_asset_name(str(name))
+                if name_norm == base or name_norm.startswith(base) or base.startswith(name_norm):
+                    return str(name), 'digital'
+        # Digital fechado: verificar se binária ainda está aberta
+        if _is_open(ot, ativo_chave, ativo):
+            return ativo, ativo_chave
+        # Tentar outra variante binária
+        allow_otc = '-OTC' in ativo.upper()
+        new_name, new_cat = find_preferred_variant_with_rules(base, allow_otc=allow_otc)
+        if new_name and new_cat:
+            return new_name, new_cat
+    except Exception as exc:
+        _log_error("Erro em resolve_trade_variant", exc)
+    return ativo, ativo_chave
+
+
+def _do_buy_minimal(amount, ativo, direction, expiration, ativo_chave: str = 'binary'):
+    """Executa compra usando digital (buy_digital_spot) ou binária (buy) conforme ativo_chave."""
     t0 = time.perf_counter()
     try:
-        status, info = API.buy(amount, ativo, direction, expiration)
+        if ativo_chave == 'digital' and PREFER_DIGITAL:
+            status, info = API.buy_digital_spot(ativo, amount, direction, expiration)
+        else:
+            status, info = API.buy(amount, ativo, direction, expiration)
     except Exception as e:
         status, info = False, e
     t1 = time.perf_counter()
@@ -1505,8 +1553,8 @@ def _do_buy_minimal(amount, ativo, direction, expiration):
     return status, info
 
 
-def _buy_worker(direction, ativo, amount, expiration, result_container, event):
-    status, info = _do_buy_minimal(amount, ativo, direction, expiration)
+def _buy_worker(direction, ativo, amount, expiration, result_container, event, ativo_chave: str = 'binary'):
+    status, info = _do_buy_minimal(amount, ativo, direction, expiration, ativo_chave)
     result_container["res"] = {"success": bool(status), "order_id": info if status else None, "info": info}
     event.set()
 
@@ -1515,20 +1563,42 @@ def _buy_worker(direction, ativo, amount, expiration, result_container, event):
 # Rigidez
 # =========================
 def _apply_rigidez():
+    """Ajusta os filtros conforme RIGIDEZ_MODE e TIMEFRAME_MINUTES.
+
+    Diferença de rigidez M1 vs M5:
+    ─────────────────────────────
+    M5 NORMAL  : parâmetros padrão (V15_SCORE_MIN=80, ADX_MIN_M5=18, etc.)
+    M5 RÍGIDA  : ADX +2, BB_WIDTH *1.20, SLOPE *1.25, janela menor
+    M1 NORMAL  : parâmetros padrão M1 (ADX_MIN_M1=17, BB_WIDTH_MIN_M1, etc.)
+    M1 RÍGIDA  : ADX +4, BB_WIDTH *1.35, SLOPE *1.50, janela 4s,
+                 V15_SCORE_MIN=90, CONFIRM_POLLS=4 — EXTRA RÍGIDA.
+                 Um único sinal por candle M1 (bloqueio por pending_lock_until).
+    """
     global ADX_MIN_M1, ADX_MIN_M5, BB_WIDTH_MIN_M1, BB_WIDTH_MIN_M5, SLOPE_MIN_M1, SLOPE_MIN_M5
     global ENTRY_WINDOW_SECONDS_M1, ENTRY_WINDOW_SECONDS_M5
     global ATR_ADAPTIVE_FACTOR
+    global V15_SCORE_MIN, V15_CONFIRM_POLLS
     if RIGIDEZ_MODE != "rigida":
         return
-    ADX_MIN_M1 += 2.0
     ADX_MIN_M5 += 2.0
-    BB_WIDTH_MIN_M1 *= 1.20
     BB_WIDTH_MIN_M5 *= 1.20
-    SLOPE_MIN_M1 *= 1.25
     SLOPE_MIN_M5 *= 1.25
-    ENTRY_WINDOW_SECONDS_M1 = min(ENTRY_WINDOW_SECONDS_M1, 6)
     ENTRY_WINDOW_SECONDS_M5 = min(ENTRY_WINDOW_SECONDS_M5, 18)
     ATR_ADAPTIVE_FACTOR = max(ATR_ADAPTIVE_FACTOR, 0.85)
+    if TIMEFRAME_MINUTES == 1:
+        # M1 extra-rígida: filtros mais exigentes que M5 rígida
+        ADX_MIN_M1 += 4.0
+        BB_WIDTH_MIN_M1 *= 1.35
+        SLOPE_MIN_M1 *= 1.50
+        ENTRY_WINDOW_SECONDS_M1 = min(ENTRY_WINDOW_SECONDS_M1, 4)
+        ATR_ADAPTIVE_FACTOR = max(ATR_ADAPTIVE_FACTOR, 0.90)
+        V15_SCORE_MIN = 90       # Score mínimo mais alto para M1
+        V15_CONFIRM_POLLS = 4    # Mais polls de confirmação para M1
+    else:
+        ADX_MIN_M1 += 2.0
+        BB_WIDTH_MIN_M1 *= 1.20
+        SLOPE_MIN_M1 *= 1.25
+        ENTRY_WINDOW_SECONDS_M1 = min(ENTRY_WINDOW_SECONDS_M1, 6)
 
 
 # =========================
@@ -1816,6 +1886,29 @@ def ask_run_duration() -> int:
     print("  0 = sem limite (bot roda até ser interrompido manualmente).")
     while True:
         raw = input("\n👉 Minutos de operação (0 = ilimitado) [0]: ").strip() or "0"
+        try:
+            v = int(raw)
+            if v >= 0:
+                return v
+        except Exception:
+            pass
+        print("❌ Digite um número inteiro >= 0.")
+
+
+def ask_max_entries() -> int:
+    """Pergunta quantas entradas aceitas o bot deve realizar (0 = ilimitado).
+
+    O bot conta APENAS ordens que foram efetivamente aceitas pela IQ Option
+    (com order_id confirmado). Para automaticamente ao atingir esse total.
+    """
+    print("\n" + "=" * 70)
+    print("🎯 NÚMERO MÁXIMO DE ENTRADAS")
+    print("=" * 70)
+    print("  Define quantas ordens aceitas o bot deve executar.")
+    print("  0 = ilimitado (opera até Stop Loss/Win ou interrupção manual).")
+    print("  Apenas ordens confirmadas (com ID) são contadas.")
+    while True:
+        raw = input("\n👉 Número de entradas (0 = ilimitado) [0]: ").strip() or "0"
         try:
             v = int(raw)
             if v >= 0:
@@ -2230,7 +2323,7 @@ def loop_patterns(ativo: str, ativo_chave: str, tf_min: int, runtime_seconds: Op
 
 
 # =========================
-# LOOP MULTI-ATIVO (M5)
+# LOOP MULTI-ATIVO (M1/M5)
 # =========================
 def loop_patterns_multi(
     ativos: List[Tuple[str, str]],
@@ -2238,24 +2331,34 @@ def loop_patterns_multi(
     max_ativos: int = 0,
     use_otc: bool = False,
     run_minutes: int = 0,
+    max_entries: int = 0,
 ):
-    """Orquestra múltiplos ativos em único ciclo (M5). Stops globais pelo saldo.
+    """Orquestra múltiplos ativos em único ciclo (M1 ou M5). Stops globais pelo saldo.
 
     Gestão dinâmica de ativos:
     - Se um ativo falhar na entrada (buy), é removido imediatamente e o bot
-      tenta preencher com outro disponível em M5.
+      tenta preencher com outro disponível.
     - A cada novo candle, re-verifica o pool completo (favoritos + book) e
-      re-inclui qualquer ativo que agora aceite M5 (sem ban permanente).
+      re-inclui qualquer ativo disponível (sem ban permanente).
     - Se não houver ativos disponíveis, aguarda e continua tentando a cada ciclo.
     - run_minutes > 0: encerra automaticamente após esse número de minutos.
+    - max_entries > 0: encerra após atingir esse número de ordens ACEITAS.
+
+    Prioridade Digital:
+    - Antes de cada entrada, resolve_trade_variant() re-verifica se o mercado
+      DIGITAL está aberto para o ativo. Se sim, usa buy_digital_spot(). Se não,
+      usa buy() (binária). Assim o bot sempre prioriza digital e cai para binária.
     """
 
     period = tf_min * 60
-    expiration = tf_min  # M5 -> expiração 5 min
+    expiration = tf_min
     _max_ativos = max_ativos if max_ativos > 0 else len(ativos)
 
     # Temporizador de finalização automática
     end_time: Optional[float] = (time.time() + run_minutes * 60) if run_minutes > 0 else None
+
+    # Contador de entradas aceitas
+    entries_accepted: int = 0
 
     # Lista mutável de ativos ativos
     active_ativos: List[Tuple[str, str]] = list(ativos)
@@ -2294,12 +2397,14 @@ def loop_patterns_multi(
     )
     for a, ak in active_ativos:
         console_event(f"  📊 {display_asset_name(a)} ({ak})")
+    if max_entries > 0:
+        console_event(f"  🎯 Limite de entradas: {max_entries}")
 
     # Controle do recheck por candle
     last_recheck_cid: int = -1
 
     def _refill_pool(now_cid: int) -> None:
-        """Re-verifica o pool completo e adiciona ativos M5 disponíveis."""
+        """Re-verifica o pool completo e adiciona ativos disponíveis."""
         nonlocal last_recheck_cid
         if now_cid == last_recheck_cid:
             return
@@ -2323,17 +2428,17 @@ def loop_patterns_multi(
             added.append(candidate)
         if added:
             console_event(
-                f"➕ Ativos re-incluídos no pool M5: "
+                f"➕ Ativos re-incluídos no pool M{tf_min}: "
                 + ", ".join(display_asset_name(a) for a in added)
             )
 
     def _replace_asset(failed_ativo: str) -> None:
-        """Remove ativo com falha e tenta preencher imediatamente com outro M5."""
+        """Remove ativo com falha e tenta preencher imediatamente com outro."""
         nonlocal active_ativos
         active_ativos = [(a, c) for a, c in active_ativos if a != failed_ativo]
         console_event(
             f"⚠️  [{display_asset_name(failed_ativo)}] Removido do pool "
-            f"(falha de entrada M5). Buscando substituto..."
+            f"(falha de entrada M{tf_min}). Buscando substituto..."
         )
         active_names = {a.upper() for a, _ in active_ativos}
         try:
@@ -2350,11 +2455,18 @@ def loop_patterns_multi(
             _init_asset_state(candidate)
             active_names.add(candidate.upper())
             console_event(
-                f"➕ [{display_asset_name(candidate)}] Adicionado como substituto M5."
+                f"➕ [{display_asset_name(candidate)}] Adicionado como substituto M{tf_min}."
             )
             break
 
     while True:
+        # Verificação: limite de entradas aceitas atingido
+        if max_entries > 0 and entries_accepted >= max_entries:
+            console_event(
+                f"🎯 Limite de {max_entries} entradas aceitas atingido. Encerrando bot."
+            )
+            break
+
         # Verificação global de stop
         bal = get_available_balance()
         if stop_loss_threshold and bal is not None and bal <= stop_loss_threshold:
@@ -2380,10 +2492,11 @@ def loop_patterns_multi(
 
         if not active_ativos:
             console_event(
-                "⏸️  Nenhum ativo disponível em M5 no momento. "
+                f"⏸️  Nenhum ativo disponível em M{tf_min} no momento. "
                 "Aguardando abertura de mercado..."
             )
-            time.sleep(IDLE_SLEEP_S_M5 * EMPTY_POOL_SLEEP_MULTIPLIER)
+            idle_sleep = IDLE_SLEEP_S_M5 if tf_min == 5 else IDLE_SLEEP_S_M1
+            time.sleep(idle_sleep * EMPTY_POOL_SLEEP_MULTIPLIER)
             continue
 
         for ativo, ativo_chave in list(active_ativos):
@@ -2454,9 +2567,14 @@ def loop_patterns_multi(
                     amount_to_use = compute_amount(saldo_before)
                     secs_left = seconds_left_in_period(tf_min)
 
+                    # Re-verificar digital/binária antes de cada entrada
+                    trade_ativo, trade_chave = resolve_trade_variant(ativo, ativo_chave)
+                    market_type_label = "DIGITAL" if trade_chave == 'digital' else "BINÁRIA"
+
                     console_event(
                         f"🕯️ [{server_hhmmss()}] [{display_asset_name(ativo)}] Sinal confirmado: {patt} | "
-                        f"Entrada: {direction.upper()} | ${amount_to_use:.2f} | secs_left={secs_left}"
+                        f"Entrada: {direction.upper()} | ${amount_to_use:.2f} | "
+                        f"Mercado: {market_type_label} ({display_asset_name(trade_ativo)}) | secs_left={secs_left}"
                     )
 
                     result_container: Dict[str, Any] = {}
@@ -2464,13 +2582,13 @@ def loop_patterns_multi(
                     if USE_BUY_THREAD:
                         t = threading.Thread(
                             target=_buy_worker,
-                            args=(direction, ativo, amount_to_use, expiration, result_container, ev),
+                            args=(direction, trade_ativo, amount_to_use, expiration, result_container, ev, trade_chave),
                             daemon=True
                         )
                         t.start()
                         ev.wait(timeout=25.0)
                     else:
-                        status_b, info_b = _do_buy_minimal(amount_to_use, ativo, direction, expiration)
+                        status_b, info_b = _do_buy_minimal(amount_to_use, trade_ativo, direction, expiration, trade_chave)
                         result_container["res"] = {
                             "success": bool(status_b),
                             "order_id": info_b if status_b else None,
@@ -2479,18 +2597,59 @@ def loop_patterns_multi(
 
                     res = result_container.get("res", {})
                     if not res.get("success"):
-                        console_event(
-                            f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] Falha ao enviar ordem."
-                        )
-                        per_asset_pending[ativo] = None
-                        per_asset_pending_id[ativo] = None
-                        # Remove ativo imediatamente e busca substituto M5
-                        _replace_asset(ativo)
-                        break
+                        if trade_chave == 'digital':
+                            console_event(
+                                f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
+                                f"Falha ao enviar ordem (DIGITAL). Tentando binária como fallback..."
+                            )
+                        else:
+                            console_event(
+                                f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] Falha ao enviar ordem."
+                            )
+                        # Se falhou no digital, tentar binária como fallback
+                        if trade_chave == 'digital':
+                            fb_name, fb_chave = find_preferred_variant_with_rules(
+                                _normalize_asset_name(re.sub(r'[-]?(OTC|OP)$', '', ativo.upper())),
+                                allow_otc='-OTC' in ativo.upper()
+                            )
+                            if fb_name and fb_chave and fb_chave != 'digital':
+                                fb_container: Dict[str, Any] = {}
+                                fb_ev = threading.Event()
+                                if USE_BUY_THREAD:
+                                    fb_t = threading.Thread(
+                                        target=_buy_worker,
+                                        args=(direction, fb_name, amount_to_use, expiration, fb_container, fb_ev, fb_chave),
+                                        daemon=True
+                                    )
+                                    fb_t.start()
+                                    fb_ev.wait(timeout=25.0)
+                                else:
+                                    fb_s, fb_i = _do_buy_minimal(amount_to_use, fb_name, direction, expiration, fb_chave)
+                                    fb_container["res"] = {"success": bool(fb_s), "order_id": fb_i if fb_s else None, "info": fb_i}
+                                fb_res = fb_container.get("res", {})
+                                if fb_res.get("success"):
+                                    res = fb_res
+                                    trade_ativo = fb_name
+                                    trade_chave = fb_chave
+                                    market_type_label = "BINÁRIA"
+                                    console_event(
+                                        f"✅ [{server_hhmmss()}] Fallback BINÁRIA aceito: {display_asset_name(fb_name)}"
+                                    )
+                        if not res.get("success"):
+                            per_asset_pending[ativo] = None
+                            per_asset_pending_id[ativo] = None
+                            # Remove ativo imediatamente e busca substituto
+                            _replace_asset(ativo)
+                            break
 
+                    # Chegamos aqui apenas quando res.get("success") é True
                     order_id = res.get("order_id")
+                    if order_id is not None:
+                        entries_accepted += 1
                     console_event(
-                        f"✅ [{server_hhmmss()}] [{display_asset_name(ativo)}] Ordem aceita | ID: {order_id}"
+                        f"✅ [{server_hhmmss()}] [{display_asset_name(ativo)}] Ordem aceita ({market_type_label}) | "
+                        f"ID: {order_id} | Entradas: {entries_accepted}"
+                        + (f"/{max_entries}" if max_entries > 0 else "")
                     )
                     console_event(
                         f"⏳ [{server_hhmmss()}] [{display_asset_name(ativo)}] Aguardando resultado..."
@@ -2544,6 +2703,7 @@ def loop_patterns_multi(
                                     amount_to_use, f"{BUY_LATENCY_AVG:.6f}",
                                     patt, pend.get("pattern_from"),
                                     secs_left,
+                                    trade_ativo, trade_chave,
                                 ])
                     except Exception:
                         pass
@@ -2577,9 +2737,9 @@ def loop_patterns_multi(
             per_asset_pending_id[ativo] = new_pend_id
             per_asset_lock_until[ativo] = int(sig["expected_confirm_from"]) + period
 
-        time.sleep(IDLE_SLEEP_S_M5)
+        time.sleep(IDLE_SLEEP_S_M5 if tf_min == 5 else IDLE_SLEEP_S_M1)
 
-    print("✅ Loop multi-ativo finalizado.")
+    print(f"✅ Loop multi-ativo finalizado. Entradas aceitas: {entries_accepted}")
 
 
 # =========================
@@ -2593,7 +2753,7 @@ if __name__ == '__main__':
     connect()
 
     print("\n" + "=" * 70)
-    print(f"🤖 BOT DINVELAS M5  |  v{BOTDIN_VERSION}")
+    print(f"🤖 BOT DINVELAS M1/M5  |  v{BOTDIN_VERSION}")
     print("=" * 70)
 
     # Conta
@@ -2609,12 +2769,18 @@ if __name__ == '__main__':
     API.change_balance(conta)
     print(f"✅ Conta selecionada: {'DEMO' if conta == 'PRACTICE' else 'REAL'}")
 
+    # Timeframe (M1 ou M5)
+    TIMEFRAME_MINUTES = ask_timeframe()
+
     # Tipo de mercado
     use_otc = ask_market_type()
     market_label = "OTC" if use_otc else "Mercado Aberto"
 
     # Número de ativos simultâneos
     max_ativos = ask_num_assets()
+
+    # Número máximo de entradas
+    MAX_ENTRIES = ask_max_entries()
 
     # Stops
     ask_stop_loss_win()
@@ -2625,10 +2791,16 @@ if __name__ == '__main__':
     # Temporizador de finalização automática
     run_minutes = ask_run_duration()
 
-    # Configurações fixas para esta versão
-    TIMEFRAME_MINUTES = 5
+    # Modo fixo: REVERSÃO
     ENTRY_MODE = "reversal"
-    RIGIDEZ_MODE = "normal"
+
+    # Rigidez: M1 → automático RÍGIDA (extra-rígida); M5 → normal (usuário pode ajustar)
+    if TIMEFRAME_MINUTES == 1:
+        RIGIDEZ_MODE = "rigida"
+        print(f"\n⚠️  Timeframe M1 detectado: aplicando modo EXTRA RÍGIDO automaticamente.")
+        print("   (Score mínimo=90, ADX+4, BB_width*1.35, slope*1.50, janela 4s)")
+    else:
+        RIGIDEZ_MODE = "normal"
     _apply_rigidez()
 
     # Montar lista de ativos inicial (pode estar vazia se mercado ainda fechado)
@@ -2636,13 +2808,13 @@ if __name__ == '__main__':
     ativos_lista = build_asset_list(use_otc=use_otc, max_count=max_ativos)
     if not ativos_lista:
         print(
-            f"⚠️  Nenhum ativo {market_label} disponível em M5 agora. "
+            f"⚠️  Nenhum ativo {market_label} disponível em M{TIMEFRAME_MINUTES} agora. "
             "O bot vai aguardar e tentar a cada ciclo conforme os mercados abrirem."
         )
 
     # Inicializar paths de log com tag automática
     market_tag = "otc" if use_otc else "op"
-    auto_tag = f"m5_{market_tag}_{max_ativos}ativos"
+    auto_tag = f"m{TIMEFRAME_MINUTES}_{market_tag}_{max_ativos}ativos"
     _init_paths_with_tag(auto_tag)
     _ensure_csv_headers()
 
@@ -2655,7 +2827,9 @@ if __name__ == '__main__':
         print(f'👤 Usuário: {nome}')
     print(f'InstanceTag: {INSTANCE_TAG}')
     print(f'Conta: {"DEMO" if conta == "PRACTICE" else "REAL"} | Mercado: {market_label}')
-    print(f'Timeframe: M5 | Modo: REVERSÃO | Ativos: {len(ativos_lista)}/{max_ativos}')
+    print(f'Timeframe: M{TIMEFRAME_MINUTES} | Modo: REVERSÃO | Rigidez: {RIGIDEZ_MODE.upper()}')
+    print(f'Prioridade: DIGITAL → BINÁRIA (fallback) | PREFER_DIGITAL={PREFER_DIGITAL}')
+    print(f'Ativos: {len(ativos_lista)}/{max_ativos}')
     print('Ativos selecionados:')
     for a, ak in ativos_lista:
         print(f'  - {display_asset_name(a)} ({ak})')
@@ -2665,7 +2839,9 @@ if __name__ == '__main__':
         print(f'Valor por operação: {AMOUNT_PERCENT:.2f}% do saldo')
     print(f'StopLoss: {STOP_LOSS_PCT:.2f}% | StopWin: {STOP_WIN_PCT:.2f}%')
     timer_label = f"{run_minutes} min" if run_minutes > 0 else "ilimitado"
-    print(f'Temporizador: {timer_label} | Tipo: somente binary')
+    entries_label = str(MAX_ENTRIES) if MAX_ENTRIES > 0 else "ilimitado"
+    print(f'Temporizador: {timer_label} | Entradas máx: {entries_label}')
+    print(f'V15_SCORE_MIN={V15_SCORE_MIN} | ADX_M1={ADX_MIN_M1:.1f} | ADX_M5={ADX_MIN_M5:.1f}')
     print(f'Logs: {LOG_DIR.as_posix()}/ | State: {STATE_DIR.as_posix()}/')
     print('=' * 70)
     print('\n🚀 Iniciando...\n')
@@ -2677,6 +2853,7 @@ if __name__ == '__main__':
             max_ativos=max_ativos,
             use_otc=use_otc,
             run_minutes=run_minutes,
+            max_entries=MAX_ENTRIES,
         )
     except KeyboardInterrupt:
         print("\nInterrompido pelo usuário.")
