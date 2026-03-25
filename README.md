@@ -96,10 +96,26 @@ nome real da IQ Option ao buscar no book digital:
   - Janelas de entrada (`ENTRY_WINDOW_SECONDS_M1/M5`)  
   - Timeouts de resultado (`M1_RESULT_TIMEOUT`, `M5_RESULT_TIMEOUT`)
 
-### 3. Estratégia Extra Rígida para M1
+### 3. Perfis do M1: Conservador e Extra Rígido
 
-Ao selecionar **M1**, o modo `RIGIDA` é **aplicado automaticamente** com parâmetros ainda mais  
-exigentes que o M5 rígido:
+Ao selecionar **M1**, o bot pergunta qual **perfil** usar:
+
+#### M1 Conservador ✅ (recomendado para uso operacional)
+
+Parâmetros equilibrados para frequência saudável de entradas, mantendo qualidade técnica:
+
+| Parâmetro | Valor |
+|-----------|-------|
+| `V15_SCORE_MIN` | **84** |
+| `V15_CONFIRM_POLLS` | **2** |
+| `ADX_MIN_M1` | **18** |
+| `BB_WIDTH_MIN_M1` | **0.00050** |
+| `SLOPE_MIN_M1` | **0.00009** |
+| `ENTRY_WINDOW_SECONDS_M1` | **5s** |
+
+#### M1 Extra Rígido 🔬 (laboratório/apresentação)
+
+Parâmetros ultra-seletivos para demonstração de robustez — pouquíssimas entradas:
 
 | Parâmetro | M5 Normal | M5 Rígido | M1 Extra-Rígido |
 |-----------|-----------|-----------|-----------------|
@@ -111,14 +127,44 @@ exigentes que o M5 rígido:
 | `ENTRY_WINDOW_SECONDS_M1` | 8s | 6s | **4s** |
 | `ATR_ADAPTIVE_FACTOR` | 0.70 | 0.85 | **0.90** |
 
-- **Score mínimo mais alto** (90 vs 80): sinal precisa de mais evidência  
-- **Filtros de tendência e volatilidade mais exigentes** (ADX, BB width, slope)  
-- **Buffer de confirmação reduzido** (janela de 4s ao invés de 8s)  
-- **Mais polls de confirmação** (4 ao invés de 3)  
 - **Bloqueio por candle**: `pending_lock_until` garante apenas 1 sinal ativo por ativo/candle  
 - Para calibração: ajuste as constantes `V15_SCORE_MIN`, `ADX_MIN_M1`, etc.
 
-### 4. Número Máximo de Entradas
+### 4. Filtro Estrutural M1 (v15.2)
+
+Complementa o motor V15 no timeframe M1 com localização estrutural no **micro-range recente**:
+
+- **Janela**: últimas **8 velas** (ajustável via `M1_STRUCTURAL_CANDLES`)
+- **CALL**: aceito somente se o fechamento da vela de sinal está no **1/3 inferior** do micro-range → zona de suporte recente
+- **PUT**: aceito somente se o fechamento da vela de sinal está no **1/3 superior** do micro-range → zona de resistência recente
+- Sinais no **meio do range** são descartados automaticamente (zonas ruidosas)
+- Se não houver velas suficientes, o filtro não bloqueia (fail-safe)
+
+Este filtro melhora a qualidade das entradas M1 sem precisar endurecer os filtros quantitativos.
+
+### 5. Confirmação M1 com Margem Dinâmica (ATR)
+
+Para sinais V15 no **M1**, a confirmação usa uma **margem proporcional ao ATR** em vez de comparação direta com o fechamento, reduzindo falsos positivos causados por micro-oscilações:
+
+- **CALL confirmado**: `preço atual > fechamento da vela de sinal + (ATR × 0.1)`
+- **PUT confirmado**: `preço atual < fechamento da vela de sinal − (ATR × 0.1)`
+
+Para o M5, a confirmação continua usando comparação direta com o fechamento (comportamento original).
+
+**Preset documentado (M1 Conservador):**
+
+```python
+V15_SCORE_MIN = 84
+V15_CONFIRM_POLLS = 2
+ADX_MIN_M1 = 18
+BB_WIDTH_MIN_M1 = 0.00050
+SLOPE_MIN_M1 = 0.00009
+ENTRY_WINDOW_SECONDS_M1 = 5
+# + filtro estrutural leve (1/3 micro-range, janela 8 velas)
+# + confirmação com buffer ATR×0.1
+```
+
+### 6. Número Máximo de Entradas
 
 - Menu para definir quantas **ordens aceitas** o bot deve executar.  
 - Contagem baseada em **ordens confirmadas pela IQ Option** (com `order_id` válido).  
@@ -126,7 +172,7 @@ exigentes que o M5 rígido:
 - Ao atingir o limite: **bot encerra automaticamente** exibindo o total.  
 - `0` = ilimitado (bot opera até Stop/Temporizador/interrupção manual).
 
-### 5. Logs e Prints Detalhados
+### 7. Logs e Prints Detalhados
 
 Todos os passos são exibidos no console com emojis e timestamps:
 
@@ -151,7 +197,7 @@ Arquivos de log (pasta `logs/`):
 | `blocked_reasons_<tag>.log` | Motivos de bloqueio (ATR baixo, ADX fraco, etc.) |
 | `runtime_errors_<tag>.log` | Erros em tempo de execução |
 
-### 6. Stops Globais
+### 8. Stops Globais
 
 - **Stop Loss**: encerra quando saldo cai abaixo de `saldo_inicial × (1 - SL%)`.  
 - **Stop Win**: encerra quando saldo sobe acima de `saldo_inicial × (1 + SW%)`.  
@@ -173,7 +219,9 @@ O bot usa um sistema de **score composto (0–100 pontos)**:
 - **Sinal disparado** quando score ≥ `V15_SCORE_MIN` e direção vencedora supera a oposta.  
 - **Confirmação**: V15_CONFIRM_POLLS polls consecutivos confirmando a direção.  
 - **Fallback v14**: Harami Bearish/Bullish e Hammer quando V15 não atinge pontuação mínima.  
-- **Filtro estrutural M5**: sinal M5 só é aceito se a vela candidata estiver no extremo do range (20% mais baixo para CALL, 20% mais alto para PUT).
+- **Filtro estrutural M5**: sinal M5 só é aceito se a vela candidata estiver no extremo do range (20% mais baixo para CALL, 20% mais alto para PUT).  
+- **Filtro estrutural M1**: sinal M1 só é aceito se a vela candidata estiver no 1/3 inferior (CALL) ou 1/3 superior (PUT) do micro-range das últimas 8 velas.  
+- **Confirmação M1 com margem ATR**: no timeframe M1, a confirmação V15 usa buffer `ATR × 0.1` para filtrar ruído de micro-oscilação.
 
 ---
 
@@ -207,15 +255,16 @@ GBPUSD-OP
 |-----------|--------|-----------|
 | `PREFER_DIGITAL` | `True` | Prioriza mercado digital |
 | `MAX_ENTRIES` | `0` | Definido no menu (0 = ilimitado) |
-| `V15_SCORE_MIN` | `80` | Score mínimo M5 (90 para M1 rígido) |
+| `V15_SCORE_MIN` | `80` | Score mínimo M5 (84 para M1 conservador, 90 para M1 extra rígido) |
 | `CANDLES_LOOKBACK` | `320` | Candles buscados por ciclo |
 | `MIN_CANDLES_REQUIRED` | `120` | Mínimo para análise |
 | `PURCHASE_BUFFER_SECONDS` | `8` | Buffer antes do fechamento do candle |
 | `ATR_MIN_RATIO_ABS_M1/M5` | variável | Limiar mínimo de ATR |
 | `M5_EXTREME_FRAC` | `0.20` | Tolerância do filtro estrutural M5 (20%) |
+| `M1_STRUCTURAL_CANDLES` | `8` | Janela do filtro estrutural M1 (velas) |
 
 ---
 
 ## Versão
 
-`2026-03-25-m1m5-digital-v2`
+`2026-03-25-m1m5-digital-v3`

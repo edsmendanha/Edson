@@ -17,7 +17,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from configobj import ConfigObj
 from iqoptionapi.stable_api import IQ_Option
 
-BOTDIN_VERSION = "2026-03-25-m1m5-digital-v2"
+BOTDIN_VERSION = "2026-03-25-m1m5-digital-v3"
 
 # =========================
 # CONFIG
@@ -166,6 +166,7 @@ OPEN_TIME_CACHE_TTL_S = 15
 _last_open_time_cache: Dict[Tuple[str, Optional[str]], Tuple[bool, float]] = {}
 
 RIGIDEZ_MODE = "normal"
+M1_PROFILE = "conservador"  # "conservador" (operacional) ou "extra_rigido" (laboratório)
 
 AMOUNT_MODE = "fixed"
 AMOUNT_FIXED = 1.0
@@ -909,6 +910,51 @@ def _m5_extreme_filter(direction: str, velas: List[Dict[str, Any]]) -> bool:
         return candidate_close >= range_high - threshold
 
 
+# =========================
+# FILTRO ESTRUTURAL M1 (v15.2)
+# Aplicado exclusivamente no timeframe M1 para sinais V15.
+# Garante que a vela candidata esteja no 1/3 extremo do micro-range,
+# evitando reversões no meio do range (zonas ruidosas para M1).
+# Para ajuste futuro: altere M1_STRUCTURAL_CANDLES (janela).
+# =========================
+M1_STRUCTURAL_CANDLES = 8  # Janela de velas para definir o micro-range estrutural M1
+
+
+def _m1_structural_filter(direction: str, velas: List[Dict[str, Any]]) -> bool:
+    """
+    Filtro de localização estrutural leve para M1 (v15.2).
+
+    Verifica se o fechamento da vela candidata (penúltima da lista)
+    está no 1/3 extremo do micro-range das últimas M1_STRUCTURAL_CANDLES velas:
+      - CALL: close no 1/3 inferior do micro-range → favorece reversão de alta
+      - PUT : close no 1/3 superior do micro-range → favorece reversão de baixa
+
+    Retorna True se o sinal PASSA o filtro, False se deve ser rejeitado.
+    Se não houver velas suficientes, não bloqueia (passa por padrão).
+    """
+    window = velas[-(M1_STRUCTURAL_CANDLES + 1):-1]
+    if len(window) < 3:
+        return True  # não bloqueia por falta de dados
+
+    closes = [float(v.get("close", 0)) for v in window]
+    high = max(closes)
+    low = min(closes)
+    rng = high - low
+
+    if rng < 1e-10:
+        return True  # range degenerado → não bloqueia
+
+    candidate_close = closes[-1]
+    third = rng / 3.0
+
+    if direction == "call":
+        # Aceita se fechamento está no 1/3 inferior do micro-range
+        return candidate_close <= low + third
+    else:  # put
+        # Aceita se fechamento está no 1/3 superior do micro-range
+        return candidate_close >= high - third
+
+
 def _v15_rsi(closes: List[float], period: int = 14) -> Optional[float]:
     """Calcula RSI (Relative Strength Index) com suavização Wilder."""
     if len(closes) < period + 2:
@@ -1100,8 +1146,11 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
     if call_score >= V15_SCORE_MIN and call_score > put_score:
         # ── Filtro estrutural M5 (v15.1): só aceita sinal no extremo do range ──
         # Aplicado exclusivamente no M5 para evitar reversão no meio do range.
-        # Demais timeframes (M1 etc.) passam direto sem este filtro.
         if tf_min == 5 and not _m5_extreme_filter("call", velas):
+            return None
+        # ── Filtro estrutural M1 (v15.2): só aceita sinal no 1/3 inferior ──
+        # Garante que sinal de CALL no M1 esteja na zona de suporte estrutural.
+        elif tf_min == 1 and not _m1_structural_filter("call", velas):
             return None
         return {
             "pattern_name": "ReversalV15_CALL",
@@ -1116,6 +1165,10 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
     if put_score >= V15_SCORE_MIN and put_score > call_score:
         # ── Filtro estrutural M5 (v15.1): só aceita sinal no extremo do range ──
         if tf_min == 5 and not _m5_extreme_filter("put", velas):
+            return None
+        # ── Filtro estrutural M1 (v15.2): só aceita sinal no 1/3 superior ──
+        # Garante que sinal de PUT no M1 esteja na zona de resistência estrutural.
+        elif tf_min == 1 and not _m1_structural_filter("put", velas):
             return None
         return {
             "pattern_name": "ReversalV15_PUT",
@@ -1172,7 +1225,14 @@ def confirm_pending(tf_min: int, pending: Dict[str, Any], velas: List[Dict[str, 
     ───────────────────────────
     Para sinais V15 (pattern_mode='v15'):
       Requer V15_CONFIRM_POLLS polls consecutivos onde o preço confirma
-      a direção prevista (acima/abaixo do fechamento da vela de sinal).
+      a direção prevista.
+
+      Para M1: usa margem dinâmica baseada no ATR (preço > fechamento + ATR*0.1
+      para call, preço < fechamento - ATR*0.1 para put), reduzindo falsos
+      confirmações por ruído/micro-oscilação.
+
+      Para M5: comparação direta com fechamento da vela de sinal.
+
       NOTA: modifica pending['v15_confirm_count'] diretamente a cada poll
       para rastrear o progresso de sustentação (efeito colateral intencional).
 
@@ -1220,9 +1280,16 @@ def confirm_pending(tf_min: int, pending: Dict[str, Any], velas: List[Dict[str, 
 
         c_price = float(c_confirm.get("close", c_confirm.get("open", p_ref)))
 
-        # Verifica confirmação de direção no poll atual
-        confirmed_now = (direction_hint == "call" and c_price > p_ref) or \
-                        (direction_hint == "put" and c_price < p_ref)
+        # Para M1: usa margem dinâmica proporcional ao ATR (buffer anti-ruído)
+        # Para M5: comparação direta com fechamento (comportamento original)
+        if tf_min == 1:
+            atr = calculate_atr_from_candles(velas, periodo=ATR_PERIOD)
+            price_buffer = (atr * 0.1) if atr is not None else 0.0
+            confirmed_now = (direction_hint == "call" and c_price > p_ref + price_buffer) or \
+                            (direction_hint == "put" and c_price < p_ref - price_buffer)
+        else:
+            confirmed_now = (direction_hint == "call" and c_price > p_ref) or \
+                            (direction_hint == "put" and c_price < p_ref)
 
         if confirmed_now:
             # Incrementa contador de polls confirmados consecutivos
@@ -1581,16 +1648,17 @@ def _buy_worker(direction, ativo, amount, expiration, result_container, event, a
 # Rigidez
 # =========================
 def _apply_rigidez():
-    """Ajusta os filtros conforme RIGIDEZ_MODE e TIMEFRAME_MINUTES.
+    """Ajusta os filtros conforme RIGIDEZ_MODE, TIMEFRAME_MINUTES e M1_PROFILE.
 
     Diferença de rigidez M1 vs M5:
     ─────────────────────────────
-    M5 NORMAL  : parâmetros padrão (V15_SCORE_MIN=80, ADX_MIN_M5=18, etc.)
-    M5 RÍGIDA  : ADX +2, BB_WIDTH *1.20, SLOPE *1.25, janela menor
-    M1 NORMAL  : parâmetros padrão M1 (ADX_MIN_M1=17, BB_WIDTH_MIN_M1, etc.)
-    M1 RÍGIDA  : ADX +4, BB_WIDTH *1.35, SLOPE *1.50, janela 4s,
-                 V15_SCORE_MIN=90, CONFIRM_POLLS=4 — EXTRA RÍGIDA.
-                 Um único sinal por candle M1 (bloqueio por pending_lock_until).
+    M5 NORMAL      : parâmetros padrão (V15_SCORE_MIN=80, ADX_MIN_M5=18, etc.)
+    M5 RÍGIDA      : ADX +2, BB_WIDTH *1.20, SLOPE *1.25, janela menor
+    M1 CONSERVADOR : V15_SCORE_MIN=84, CONFIRM_POLLS=2, ADX=18, BB_WIDTH=0.00050,
+                     SLOPE=0.00009, janela 5s — modo operacional equilibrado.
+    M1 EXTRA RÍGIDO: ADX +4, BB_WIDTH *1.35, SLOPE *1.50, janela 4s,
+                     V15_SCORE_MIN=90, CONFIRM_POLLS=4 — EXTRA RÍGIDA.
+                     Um único sinal por candle M1 (bloqueio por pending_lock_until).
     """
     global ADX_MIN_M1, ADX_MIN_M5, BB_WIDTH_MIN_M1, BB_WIDTH_MIN_M5, SLOPE_MIN_M1, SLOPE_MIN_M5
     global ENTRY_WINDOW_SECONDS_M1, ENTRY_WINDOW_SECONDS_M5
@@ -1604,14 +1672,23 @@ def _apply_rigidez():
     ENTRY_WINDOW_SECONDS_M5 = min(ENTRY_WINDOW_SECONDS_M5, 18)
     ATR_ADAPTIVE_FACTOR = max(ATR_ADAPTIVE_FACTOR, 0.85)
     if TIMEFRAME_MINUTES == 1:
-        # M1 extra-rígida: filtros mais exigentes que M5 rígida
-        ADX_MIN_M1 += 4.0
-        BB_WIDTH_MIN_M1 *= 1.35
-        SLOPE_MIN_M1 *= 1.50
-        ENTRY_WINDOW_SECONDS_M1 = min(ENTRY_WINDOW_SECONDS_M1, 4)
-        ATR_ADAPTIVE_FACTOR = max(ATR_ADAPTIVE_FACTOR, 0.90)
-        V15_SCORE_MIN = 90       # Score mínimo mais alto para M1
-        V15_CONFIRM_POLLS = 4    # Mais polls de confirmação para M1
+        if M1_PROFILE == "extra_rigido":
+            # M1 extra-rígida: filtros mais exigentes que M5 rígida
+            ADX_MIN_M1 += 4.0
+            BB_WIDTH_MIN_M1 *= 1.35
+            SLOPE_MIN_M1 *= 1.50
+            ENTRY_WINDOW_SECONDS_M1 = min(ENTRY_WINDOW_SECONDS_M1, 4)
+            ATR_ADAPTIVE_FACTOR = max(ATR_ADAPTIVE_FACTOR, 0.90)
+            V15_SCORE_MIN = 90       # Score mínimo mais alto para M1 extra rígido
+            V15_CONFIRM_POLLS = 4    # Mais polls de confirmação para M1 extra rígido
+        else:
+            # M1 conservador: parâmetros equilibrados para uso operacional
+            ADX_MIN_M1 = 18.0
+            BB_WIDTH_MIN_M1 = 0.00050
+            SLOPE_MIN_M1 = 0.00009
+            ENTRY_WINDOW_SECONDS_M1 = 5
+            V15_SCORE_MIN = 84       # Score moderado — mais entradas sem perder qualidade
+            V15_CONFIRM_POLLS = 2    # Confirmação rápida adequada ao M1
     else:
         ADX_MIN_M1 += 2.0
         BB_WIDTH_MIN_M1 *= 1.20
@@ -1812,6 +1889,23 @@ def ask_timeframe():
             return 1
         if r == "2":
             return 5
+
+
+def ask_m1_profile():
+    """Pergunta ao usuário qual perfil do M1 deseja usar."""
+    print("\n" + "=" * 70)
+    print("⚙️  PERFIL M1")
+    print("=" * 70)
+    print("  1) M1 Conservador  ✅  (operacional — mais entradas, filtros equilibrados)")
+    print("     Score=84, Polls=2, ADX=18, BB=0.00050, Slope=0.00009, Janela=5s")
+    print("  2) M1 Extra Rígido 🔬  (laboratório/apresentação — muito seletivo)")
+    print("     Score=90, Polls=4, ADX+4, BB×1.35, Slope×1.50, Janela=4s")
+    while True:
+        r = input("\n👉 Digite 1 ou 2 [1]: ").strip() or "1"
+        if r == "1":
+            return "conservador"
+        if r == "2":
+            return "extra_rigido"
 
 
 def ask_entry_mode():
@@ -2842,11 +2936,16 @@ if __name__ == '__main__':
     # Modo fixo: REVERSÃO
     ENTRY_MODE = "reversal"
 
-    # Rigidez: M1 → automático RÍGIDA (extra-rígida); M5 → normal (usuário pode ajustar)
+    # Rigidez: M1 → pede perfil ao usuário; M5 → normal
     if TIMEFRAME_MINUTES == 1:
+        M1_PROFILE = ask_m1_profile()
         RIGIDEZ_MODE = "rigida"
-        print(f"\n⚠️  Timeframe M1 detectado: aplicando modo EXTRA RÍGIDO automaticamente.")
-        print("   (Score mínimo=90, ADX+4, BB_width*1.35, slope*1.50, janela 4s)")
+        if M1_PROFILE == "conservador":
+            print(f"\n✅ Perfil M1 Conservador selecionado (operacional).")
+            print("   (Score=84, Polls=2, ADX=18, BB=0.00050, Slope=0.00009, Janela=5s)")
+        else:
+            print(f"\n⚠️  Perfil M1 Extra Rígido selecionado (laboratório/apresentação).")
+            print("   (Score=90, Polls=4, ADX+4, BB×1.35, Slope×1.50, Janela=4s)")
     else:
         RIGIDEZ_MODE = "normal"
     _apply_rigidez()
@@ -2876,6 +2975,9 @@ if __name__ == '__main__':
     print(f'InstanceTag: {INSTANCE_TAG}')
     print(f'Conta: {"DEMO" if conta == "PRACTICE" else "REAL"} | Mercado: {market_label}')
     print(f'Timeframe: M{TIMEFRAME_MINUTES} | Modo: REVERSÃO | Rigidez: {RIGIDEZ_MODE.upper()}')
+    if TIMEFRAME_MINUTES == 1:
+        perfil_label = "Conservador" if M1_PROFILE == "conservador" else "Extra Rígido"
+        print(f'Perfil M1: {perfil_label}')
     print(f'Prioridade: DIGITAL → BINÁRIA (fallback) | PREFER_DIGITAL={PREFER_DIGITAL}')
     print(f'Ativos: {len(ativos_lista)}/{max_ativos}')
     print('Ativos selecionados:')
