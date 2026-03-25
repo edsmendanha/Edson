@@ -3,11 +3,19 @@
 # O bot prioriza esses ativos. Se menos do que o limite estiverem
 # abertos, completa automaticamente com outros do tipo escolhido.
 #
-# Exemplos (descomente para ativar):
+# Ativos DIGITAIS (sempre priorizados, inclusive índices sem sufixo):
+# Dollar Index   <- índice, só existe em digital
+# DXY            <- alias para Dollar Index (resolvido automaticamente)
+# CXY            <- Canadian Dollar Index (só digital)
+# BXY            <- Pound Index (só digital)
+#
+# Ativos Mercado Aberto (-OP):
 # EURUSD-OP
 # EURJPY-OP
 # GBPUSD-OP
 # AUDUSD-OP
 # USDJPY-OP
+#
+# Ativos OTC:
 # EURUSD-OTC
 # EURJPY-OTC

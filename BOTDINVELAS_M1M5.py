@@ -106,6 +106,24 @@ tipo = tipo_default  # binary/digital
 # Prioridade DIGITAL: True = tenta digital primeiro; cai para binária se fechada
 PREFER_DIGITAL = True
 
+# Aliases para abreviações populares → nome real no book da IQ Option
+# Chaves normalizadas (maiúsculas, sem espaços, apenas A-Z/0-9/-)
+ASSET_ALIASES: Dict[str, str] = {
+    "DXY":                   "Dollar Index",
+    "DOLLARINDEX":           "Dollar Index",
+    "DOLLAR-INDEX":          "Dollar Index",
+    "USDINDEX":              "Dollar Index",
+    "USD-INDEX":             "Dollar Index",
+    "POUNDINDEX":            "BXY",
+    "POUND-INDEX":           "BXY",
+    "GBPINDEX":              "BXY",
+    "GBP-INDEX":             "BXY",
+    "CANADIANDOLLARINDEX":   "CXY",
+    "CANADIAN-DOLLAR-INDEX": "CXY",
+    "CADDOLLARINDEX":        "CXY",
+    "CADINDEX":              "CXY",
+}
+
 PURCHASE_BUFFER_SECONDS = int(config.get('AJUSTES', {}).get('purchase_buffer_seconds', 8))
 
 USE_BUY_THREAD = True
@@ -1631,23 +1649,50 @@ def load_favorites() -> List[str]:
 
 
 def build_asset_list(use_otc: bool, max_count: int) -> List[Tuple[str, str]]:
-    """Monta lista de (ativo, categoria) priorizando favoritos.txt.
+    """Monta lista de (ativo, categoria) priorizando DIGITAL e depois binária.
 
-    1. Lê favoritos.txt — usa os que estão abertos e correspondem ao tipo.
-    2. Completa com outros ativos abertos do tipo até max_count.
-    Apenas ativos da categoria 'binary' são considerados (digitais são ignorados).
+    1. Busca PRIMEIRO todos os ativos abertos na categoria 'digital', inclusive
+       índices sem sufixo (CXY, BXY, Dollar Index, etc.).
+    2. Adiciona ativos 'binary' abertos SOMENTE se não houver digital equivalente.
+    3. Nunca duplica: cada ativo aparece apenas uma vez (sempre preferindo digital).
+    4. Prioriza favoritos.txt (com suporte a aliases para abreviações populares).
+    5. Completa com outros ativos abertos do tipo até max_count.
     """
     try:
         ot = API.get_all_open_time()
     except Exception:
         return []
 
-    # Apenas ativos binários (ignora digital e turbo)
+    def _has_no_market_suffix(name_u: str) -> bool:
+        """Retorna True se o ativo não tem sufixo -OTC ou -OP (ex: índices como CXY, Dollar Index)."""
+        return '-OTC' not in name_u and '-OP' not in name_u
+
     open_assets: List[Tuple[str, str]] = []
     seen: set = set()
-    table = ot.get('binary', {})
-    if isinstance(table, dict):
-        for name, info in table.items():
+
+    # 1ª passagem: DIGITAL tem prioridade total
+    digital_table = ot.get('digital', {})
+    if isinstance(digital_table, dict):
+        for name, info in digital_table.items():
+            if not (isinstance(info, dict) and info.get('open')):
+                continue
+            name_u = str(name).upper()
+            if name_u in seen:
+                continue
+            # Inclui se: sufixo correto para o tipo OU índice sem sufixo (sempre digital)
+            if use_otc:
+                if '-OTC' in name_u or _has_no_market_suffix(name_u):
+                    open_assets.append((name, 'digital'))
+                    seen.add(name_u)
+            else:
+                if '-OP' in name_u or _has_no_market_suffix(name_u):
+                    open_assets.append((name, 'digital'))
+                    seen.add(name_u)
+
+    # 2ª passagem: binária apenas para ativos SEM equivalente digital aberto
+    binary_table = ot.get('binary', {})
+    if isinstance(binary_table, dict):
+        for name, info in binary_table.items():
             if not (isinstance(info, dict) and info.get('open')):
                 continue
             name_u = str(name).upper()
@@ -1671,16 +1716,19 @@ def build_asset_list(use_otc: bool, max_count: int) -> List[Tuple[str, str]]:
     result: List[Tuple[str, str]] = []
     used: set = set()
 
-    # 1ª passagem: favoritos abertos (na ordem do arquivo)
+    # 1ª passagem: favoritos abertos (na ordem do arquivo, com suporte a aliases)
     for fav in favs:
         if len(result) >= max_count:
             break
-        entry = open_map.get(fav)
+        # Resolve alias: ex. "DXY" → "Dollar Index" → normalizado "DOLLARINDEX"
+        alias_target = ASSET_ALIASES.get(fav)
+        resolved = _normalize_asset_name(alias_target) if alias_target else fav
+        entry = open_map.get(resolved) or open_map.get(fav)
         if entry and entry[0].upper() not in used:
             result.append(entry)
             used.add(entry[0].upper())
 
-    # 2ª passagem: completa com outros abertos do tipo
+    # 2ª passagem: completa com outros ativos abertos do tipo
     for name, cat in open_assets:
         if len(result) >= max_count:
             break
