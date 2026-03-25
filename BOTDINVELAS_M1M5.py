@@ -142,21 +142,21 @@ ENABLE_ATR_FILTER = True
 ATR_PERIOD = 14
 ATR_ADAPTIVE_WINDOW = 30
 ATR_ADAPTIVE_FACTOR = 0.70
-ATR_MIN_RATIO_ABS_M1 = 0.000020
+ATR_MIN_RATIO_ABS_M1 = 0.000015
 ATR_MIN_RATIO_ABS_M5 = 0.000020
 ATR_RATIO_QUEUE_M1 = deque(maxlen=ATR_ADAPTIVE_WINDOW)
 ATR_RATIO_QUEUE_M5 = deque(maxlen=ATR_ADAPTIVE_WINDOW)
 
 ENABLE_TREND_STRENGTH_FILTER = True
 ADX_PERIOD = 14
-ADX_MIN_M1 = 12.0
+ADX_MIN_M1 = 10.0
 ADX_MIN_M5 = 18.0
 BB_PERIOD = 20
 BB_STD = 2.0
-BB_WIDTH_MIN_M1 = 0.00030
+BB_WIDTH_MIN_M1 = 0.00023
 BB_WIDTH_MIN_M5 = 0.00070
 SLOPE_LOOKBACK = 8
-SLOPE_MIN_M1 = 0.00008
+SLOPE_MIN_M1 = 0.00005
 SLOPE_MIN_M5 = 0.00012
 
 ENTRY_WINDOW_SECONDS_M1 = 8
@@ -1661,11 +1661,15 @@ def resolve_trade_variant(ativo: str, ativo_chave: str) -> Tuple[str, str]:
         ot = API.get_all_open_time()
         # Normalizar base do ativo (strip -OP / -OTC)
         base = _normalize_asset_name(re.sub(r'[-]?(OTC|OP)$', '', ativo.upper()))
+        allow_otc = '-OTC' in ativo.upper()
         # Tentar digital primeiro
         digital_table = ot.get('digital', {})
         if isinstance(digital_table, dict):
             for name, info in digital_table.items():
                 if not (isinstance(info, dict) and info.get('open')):
+                    continue
+                # Nunca selecionar OTC se não foi explicitamente configurado
+                if '-OTC' in str(name).upper() and not allow_otc:
                     continue
                 name_norm = _normalize_asset_name(str(name))
                 if name_norm == base or name_norm.startswith(base) or base.startswith(name_norm):
@@ -1674,7 +1678,6 @@ def resolve_trade_variant(ativo: str, ativo_chave: str) -> Tuple[str, str]:
         if _is_open(ot, ativo_chave, ativo):
             return ativo, ativo_chave
         # Tentar outra variante binária
-        allow_otc = '-OTC' in ativo.upper()
         new_name, new_cat = find_preferred_variant_with_rules(base, allow_otc=allow_otc)
         if new_name and new_cat:
             return new_name, new_cat
