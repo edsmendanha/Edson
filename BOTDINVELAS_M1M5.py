@@ -142,18 +142,18 @@ ENABLE_ATR_FILTER = True
 ATR_PERIOD = 14
 ATR_ADAPTIVE_WINDOW = 30
 ATR_ADAPTIVE_FACTOR = 0.70
-ATR_MIN_RATIO_ABS_M1 = 0.000035
+ATR_MIN_RATIO_ABS_M1 = 0.000020
 ATR_MIN_RATIO_ABS_M5 = 0.000020
 ATR_RATIO_QUEUE_M1 = deque(maxlen=ATR_ADAPTIVE_WINDOW)
 ATR_RATIO_QUEUE_M5 = deque(maxlen=ATR_ADAPTIVE_WINDOW)
 
 ENABLE_TREND_STRENGTH_FILTER = True
 ADX_PERIOD = 14
-ADX_MIN_M1 = 17.0
+ADX_MIN_M1 = 12.0
 ADX_MIN_M5 = 18.0
 BB_PERIOD = 20
 BB_STD = 2.0
-BB_WIDTH_MIN_M1 = 0.00045
+BB_WIDTH_MIN_M1 = 0.00030
 BB_WIDTH_MIN_M5 = 0.00070
 SLOPE_LOOKBACK = 8
 SLOPE_MIN_M1 = 0.00008
@@ -1724,8 +1724,8 @@ def _apply_rigidez():
     ─────────────────────────────
     M5 NORMAL      : parâmetros padrão (V15_SCORE_MIN=80, ADX_MIN_M5=18, etc.)
     M5 RÍGIDA      : ADX +2, BB_WIDTH *1.20, SLOPE *1.25, janela menor
-    M1 CONSERVADOR : V15_SCORE_MIN=84, CONFIRM_POLLS=2, ADX=18, BB_WIDTH=0.00050,
-                     SLOPE=0.00009, janela 5s — modo operacional equilibrado.
+    M1 CONSERVADOR : V15_SCORE_MIN=80, CONFIRM_POLLS=2, ADX=14, BB_WIDTH=0.00035,
+                     SLOPE=0.00008, janela 5s — modo operacional equilibrado.
     M1 EXTRA RÍGIDO: ADX +4, BB_WIDTH *1.35, SLOPE *1.50, janela 4s,
                      V15_SCORE_MIN=90, CONFIRM_POLLS=4 — EXTRA RÍGIDA.
                      Um único sinal por candle M1 (bloqueio por pending_lock_until).
@@ -1753,11 +1753,11 @@ def _apply_rigidez():
             V15_CONFIRM_POLLS = 4    # Mais polls de confirmação para M1 extra rígido
         else:
             # M1 conservador: parâmetros equilibrados para uso operacional
-            ADX_MIN_M1 = 18.0
-            BB_WIDTH_MIN_M1 = 0.00050
-            SLOPE_MIN_M1 = 0.00009
+            ADX_MIN_M1 = 14.0
+            BB_WIDTH_MIN_M1 = 0.00035
+            SLOPE_MIN_M1 = 0.00008
             ENTRY_WINDOW_SECONDS_M1 = 5
-            V15_SCORE_MIN = 84       # Score moderado — mais entradas sem perder qualidade
+            V15_SCORE_MIN = 80       # Score padrão — mais entradas mantendo qualidade
             V15_CONFIRM_POLLS = 2    # Confirmação rápida adequada ao M1
     else:
         ADX_MIN_M1 += 2.0
