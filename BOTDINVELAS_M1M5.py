@@ -17,7 +17,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from configobj import ConfigObj
 from iqoptionapi.stable_api import IQ_Option
 
-BOTDIN_VERSION = "2026-03-25-m1m5-digital-v3"
+BOTDIN_VERSION = "2026-03-25-m1m5-digital-v4"
 
 # =========================
 # CONFIG
@@ -236,8 +236,10 @@ def _ensure_csv_headers():
             csv.writer(f).writerow([
                 'ts_iso', 'instance_tag',
                 'ativo', 'tf_min', 'event',
-                'pattern_name', 'pattern_from', 'expected_confirm_from',
-                'mode', 'direction_hint', 'confirmed', 'confirm_from', 'details'
+                'pattern_name', 'pattern_mode', 'pattern_from', 'expected_confirm_from',
+                'direction_hint', 'confirmed', 'confirm_from',
+                'rsi_pts', 'bb_pts', 'wick_pts', 'imp_pts', 'call_score', 'put_score',
+                'block_reason', 'details'
             ])
 
 
@@ -274,6 +276,45 @@ def _log_blocked(reason: str, details: Optional[str] = None):
             with BLOCKED_LOG.open('a', encoding='utf-8') as f:
                 ts = datetime.now().isoformat()
                 f.write(f"{ts} | {INSTANCE_TAG} | {reason} | {details or ''}\n")
+    except Exception:
+        pass
+
+
+def _log_pattern_row(
+    ativo: str,
+    tf_min: int,
+    event: str,
+    sig: Optional[Dict[str, Any]],
+    confirmed: bool = False,
+    confirm_from: Optional[int] = None,
+    block_reason: Optional[str] = None,
+    details: Optional[str] = None,
+):
+    """Grava uma linha no PATTERNS_CSV com todos os componentes de score."""
+    try:
+        if PATTERNS_CSV is None:
+            return
+        row = [
+            now_iso(), INSTANCE_TAG,
+            ativo, tf_min, event,
+            sig.get("pattern_name", "") if sig else "",
+            sig.get("pattern_mode", "") if sig else "",
+            sig.get("pattern_from", "") if sig else "",
+            sig.get("expected_confirm_from", "") if sig else "",
+            sig.get("direction_hint", "") if sig else "",
+            "1" if confirmed else "0",
+            confirm_from if confirm_from is not None else "",
+            sig.get("rsi_pts", "") if sig else "",
+            sig.get("bb_pts", "") if sig else "",
+            sig.get("wick_pts", "") if sig else "",
+            sig.get("imp_pts", "") if sig else "",
+            sig.get("call_score", "") if sig else "",
+            sig.get("put_score", "") if sig else "",
+            block_reason or "",
+            details or "",
+        ]
+        with PATTERNS_CSV.open('a', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(row)
     except Exception:
         pass
 
@@ -840,6 +881,7 @@ def is_harami_bullish(prev_c, cur_c) -> bool:
 # --- Parâmetros fixos do motor V15 (bloco centralizado, não dispersar) ---
 # Nota rigidez: M5 normal=80 | M5 rígida≈82 | M1 normal≈80 | M1 extra-rígida=90
 V15_SCORE_MIN = 80           # Score mínimo para sinal reversal V15 (0–100); ajustado por _apply_rigidez()
+V15_SCORE_GAP_MIN = 10       # Diferença mínima exigida entre call_score e put_score (evita empates técnicos)
 V15_CONFIRM_POLLS = 3        # Polls consecutivos de confirmação sustentada necessários
 V15_RSI_PERIOD = 14          # Período RSI
 V15_RSI_OVERSOLD = 30        # RSI abaixo deste valor = oversold → sinal call
@@ -1060,11 +1102,15 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
       • Wick        (0–25 pts): sombra longa indica rejeição de preço
       • Impulso+Ctx (0–25 pts): tendência prévia confirma contexto reversal
 
-    Sinal disparado quando score >= V15_SCORE_MIN (padrão 80) e
-    a direção vencedora supera a oposta.
+    Sinal disparado quando score >= V15_SCORE_MIN E a diferença entre
+    call_score e put_score >= V15_SCORE_GAP_MIN (evita empates técnicos).
 
     Fallback v14: Harami Bearish/Bullish e Hammer preservados para
     casos onde o motor V15 não atinge pontuação mínima.
+    No M1, fallback também exige aprovação no filtro estrutural leve.
+
+    O sinal retornado inclui os componentes de score (rsi_pts, bb_pts,
+    wick_pts, imp_pts, call_score, put_score) para registro em PATTERNS_CSV.
     """
     if not velas or len(velas) < max(V15_CANDLES_NEEDED, 6):
         return None
@@ -1142,8 +1188,19 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
                  (wick_pts if wick_dir == "put" else 0) + \
                  (imp_pts if imp_dir == "put" else 0)
 
+    # Componentes de score compartilhados por todos os retornos (para log enriquecido)
+    _score_components = {
+        "rsi_pts": rsi_pts,
+        "bb_pts": bb_pts,
+        "wick_pts": wick_pts,
+        "imp_pts": imp_pts,
+        "call_score": call_score,
+        "put_score": put_score,
+    }
+
     # ── Disparo do sinal V15 ───────────────────────────────────────────────
-    if call_score >= V15_SCORE_MIN and call_score > put_score:
+    # Exige score mínimo E vantagem mínima sobre a direção oposta (score_gap_min)
+    if call_score >= V15_SCORE_MIN and (call_score - put_score) >= V15_SCORE_GAP_MIN:
         # ── Filtro estrutural M5 (v15.1): só aceita sinal no extremo do range ──
         # Aplicado exclusivamente no M5 para evitar reversão no meio do range.
         if tf_min == 5 and not _m5_extreme_filter("call", velas):
@@ -1161,8 +1218,9 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
             "v15_score": call_score,
             "v15_confirm_count": 0,
             "pattern_mode": "v15",
+            **_score_components,
         }
-    if put_score >= V15_SCORE_MIN and put_score > call_score:
+    if put_score >= V15_SCORE_MIN and (put_score - call_score) >= V15_SCORE_GAP_MIN:
         # ── Filtro estrutural M5 (v15.1): só aceita sinal no extremo do range ──
         if tf_min == 5 and not _m5_extreme_filter("put", velas):
             return None
@@ -1179,10 +1237,15 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
             "v15_score": put_score,
             "v15_confirm_count": 0,
             "pattern_mode": "v15",
+            **_score_components,
         }
 
     # ── Fallback v14: Harami Bearish / Bullish / Hammer ───────────────────
+    # No M1: fallback só é permitido se passar pelo filtro estrutural leve.
+    # No M5: fallback puro sem filtro estrutural adicional.
     if is_harami_bearish(c_prev, c_last):
+        if tf_min == 1 and not _m1_structural_filter("put", velas):
+            return None
         return {
             "pattern_name": "HaramiBearish",
             "direction_hint": "put",
@@ -1192,8 +1255,11 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
             "v15_score": 0,
             "v15_confirm_count": 0,
             "pattern_mode": "fallback",
+            **_score_components,
         }
     if is_harami_bullish(c_prev, c_last):
+        if tf_min == 1 and not _m1_structural_filter("call", velas):
+            return None
         return {
             "pattern_name": "HaramiBullish",
             "direction_hint": "call",
@@ -1203,8 +1269,11 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
             "v15_score": 0,
             "v15_confirm_count": 0,
             "pattern_mode": "fallback",
+            **_score_components,
         }
     if is_hammer(c_last):
+        if tf_min == 1 and not _m1_structural_filter("call", velas):
+            return None
         return {
             "pattern_name": "Hammer",
             "direction_hint": "call",
@@ -1214,6 +1283,7 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
             "v15_score": 0,
             "v15_confirm_count": 0,
             "pattern_mode": "fallback",
+            **_score_components,
         }
 
     return None
@@ -1762,7 +1832,8 @@ def build_asset_list(use_otc: bool, max_count: int) -> List[Tuple[str, str]]:
                     open_assets.append((name, 'digital'))
                     seen.add(name_u)
             else:
-                if '-OP' in name_u or _has_no_market_suffix(name_u):
+                # Mercado Aberto: exclui explicitamente qualquer ativo com -OTC no nome
+                if ('-OP' in name_u or _has_no_market_suffix(name_u)) and '-OTC' not in name_u:
                     open_assets.append((name, 'digital'))
                     seen.add(name_u)
 
@@ -1780,7 +1851,8 @@ def build_asset_list(use_otc: bool, max_count: int) -> List[Tuple[str, str]]:
                     open_assets.append((name, 'binary'))
                     seen.add(name_u)
             else:
-                if '-OP' in name_u:
+                # Mercado Aberto: exclui explicitamente qualquer ativo com -OTC no nome
+                if '-OP' in name_u and '-OTC' not in name_u:
                     open_assets.append((name, 'binary'))
                     seen.add(name_u)
 
@@ -2322,6 +2394,7 @@ def loop_patterns(ativo: str, ativo_chave: str, tf_min: int, runtime_seconds: Op
                 continue
 
             if status in ("expired", "rejected", "error"):
+                _log_pattern_row(ativo, tf_min, status, pending, block_reason=status)
                 pending = None
                 pending_id_active = None
                 pending_lock_until_ts = now_server + (period * 1)
@@ -2330,6 +2403,7 @@ def loop_patterns(ativo: str, ativo_chave: str, tf_min: int, runtime_seconds: Op
 
             if status == "confirmed" and direction in ("call", "put"):
                 patt = pending["pattern_name"]
+                _log_pattern_row(ativo, tf_min, "confirmed", pending, confirmed=True)
 
                 ok_win, sec, win = within_entry_window(tf_min)
                 if not ok_win:
@@ -2455,6 +2529,7 @@ def loop_patterns(ativo: str, ativo_chave: str, tf_min: int, runtime_seconds: Op
         if nowt - lastp >= PENDING_PRINT_THROTTLE_S:
             console_event(f"🕯️ Sinal detectado: {patt}. Aguardando confirmação...")
             last_pending_print_ts_by_id[pend_id] = nowt
+            _log_pattern_row(ativo, tf_min, "detected", sig)
 
         pending = sig
         pending_id_active = pend_id
@@ -2675,6 +2750,7 @@ def loop_patterns_multi(
                     continue
 
                 if status in ("expired", "rejected", "error"):
+                    _log_pattern_row(ativo, tf_min, status, pend, block_reason=status)
                     per_asset_pending[ativo] = None
                     per_asset_pending_id[ativo] = None
                     per_asset_lock_until[ativo] = now_server + period
@@ -2682,6 +2758,7 @@ def loop_patterns_multi(
 
                 if status == "confirmed" and direction in ("call", "put"):
                     patt = pend["pattern_name"]
+                    _log_pattern_row(ativo, tf_min, "confirmed", pend, confirmed=True)
 
                     ok_win, sec, win = within_entry_window(tf_min)
                     if not ok_win:
@@ -2874,6 +2951,7 @@ def loop_patterns_multi(
                     f"Aguardando confirmação..."
                 )
                 asset_last_pending_print[new_pend_id] = nowt
+                _log_pattern_row(ativo, tf_min, "detected", sig)
 
             per_asset_pending[ativo] = sig
             per_asset_pending_id[ativo] = new_pend_id
