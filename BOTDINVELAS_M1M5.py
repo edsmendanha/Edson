@@ -124,7 +124,7 @@ ASSET_ALIASES: Dict[str, str] = {
     "CADINDEX":              "CXY",
 }
 
-PURCHASE_BUFFER_SECONDS = int(config.get('AJUSTES', {}).get('purchase_buffer_seconds', 8))
+PURCHASE_BUFFER_SECONDS = int(config.get('AJUSTES', {}).get('purchase_buffer_seconds', 5))
 
 USE_BUY_THREAD = True
 BUY_LATENCY_AVG = 0.9
@@ -141,7 +141,8 @@ PENDING_EXPIRE_CANDLES = 2
 ENABLE_ATR_FILTER = True
 ATR_PERIOD = 14
 ATR_ADAPTIVE_WINDOW = 30
-ATR_ADAPTIVE_FACTOR = 0.70
+ATR_ADAPTIVE_FACTOR = 0.45        # Fator adaptativo mais leve para M1 (menos pressão no thr)
+ATR_MAX_THR_M1 = 0.00014          # Cap do threshold ATR adaptativo para M1 (teto dinâmico)
 ATR_MIN_RATIO_ABS_M1 = 0.000015
 ATR_MIN_RATIO_ABS_M5 = 0.000020
 ATR_RATIO_QUEUE_M1 = deque(maxlen=ATR_ADAPTIVE_WINDOW)
@@ -149,17 +150,17 @@ ATR_RATIO_QUEUE_M5 = deque(maxlen=ATR_ADAPTIVE_WINDOW)
 
 ENABLE_TREND_STRENGTH_FILTER = True
 ADX_PERIOD = 14
-ADX_MIN_M1 = 10.0
+ADX_MIN_M1 = 10.5                 # Filtro ADX mais leve para M1
 ADX_MIN_M5 = 18.0
 BB_PERIOD = 20
 BB_STD = 2.0
-BB_WIDTH_MIN_M1 = 0.00023
+BB_WIDTH_MIN_M1 = 0.00022         # BB width mais permissivo para M1
 BB_WIDTH_MIN_M5 = 0.00070
 SLOPE_LOOKBACK = 8
-SLOPE_MIN_M1 = 0.00005
+SLOPE_MIN_M1 = 0.00005            # Slope mínimo mais leve para M1
 SLOPE_MIN_M5 = 0.00012
 
-ENTRY_WINDOW_SECONDS_M1 = 8
+ENTRY_WINDOW_SECONDS_M1 = 10      # Janela de entrada maior para M1 (menos missed_early_entry)
 ENTRY_WINDOW_SECONDS_M5 = 25
 
 OPEN_TIME_CACHE_TTL_S = 15
@@ -700,6 +701,9 @@ def adaptive_atr_threshold_update(tf_min: int, atr_ratio: Optional[float]) -> fl
             return base
         med = statistics.median(list(q))
         dyn = max(base, med * ATR_ADAPTIVE_FACTOR)
+        # Cap do threshold adaptativo para M1: evita que suba demais e trave entradas
+        if tf_min == 1:
+            dyn = min(dyn, ATR_MAX_THR_M1)
         return max(base, dyn)
     except Exception:
         return base
@@ -793,21 +797,66 @@ def passes_trend_strength_filter(tf_min: int, velas: List[Dict[str, Any]]) -> bo
     slope_min = SLOPE_MIN_M5 if tf_min == 5 else SLOPE_MIN_M1
 
     adx = adx_from_candles(velas, period=ADX_PERIOD)
+    bbw = bb_width_norm(closes, period=BB_PERIOD, std_mult=BB_STD)
+    slope = ema_slope_norm(closes, period=21, lookback=SLOPE_LOOKBACK)
+
+    if tf_min == 1:
+        # M1: regra "3 de 4" — permite até 1 filtro abaixo do mínimo entre ATR, ADX, BBW, SLOPE
+        # Mantém segurança estrutural sem travar entradas por um indicador levemente abaixo
+        failures = 0
+        # Filtro ATR integrado (para regra 3-de-4, evita dois saltos de função)
+        if ENABLE_ATR_FILTER:
+            atr = calculate_atr_from_candles(velas, periodo=ATR_PERIOD)
+            mean_close = sum(closes[-ATR_PERIOD:]) / ATR_PERIOD if len(closes) >= ATR_PERIOD else (closes[-1] if closes else 0.0)
+            if atr is None or mean_close == 0:
+                failures += 1
+            else:
+                ratio = atr / mean_close
+                thr = adaptive_atr_threshold_update(tf_min, ratio)
+                if ratio < thr:
+                    _log_blocked("atr_low", f"tf={tf_min} ratio={ratio:.6f} thr={thr:.6f}")
+                    failures += 1
+        if adx is None or adx < adx_min:
+            _log_blocked("trend_weak_adx", f"tf={tf_min} adx={adx}")
+            failures += 1
+        if bbw is None or bbw < bb_min:
+            _log_blocked("range_squeeze_bbw", f"tf={tf_min} bbw={bbw}")
+            failures += 1
+        if slope is None or slope < slope_min:
+            _log_blocked("ema_flat_slope", f"tf={tf_min} slope={slope}")
+            failures += 1
+        if failures > 1:
+            return False
+        return True
+
+    # M5: mantém todos os filtros obrigatórios (comportamento original)
     if adx is None or adx < adx_min:
         _log_blocked("trend_weak_adx", f"tf={tf_min} adx={adx}")
         return False
 
-    bbw = bb_width_norm(closes, period=BB_PERIOD, std_mult=BB_STD)
     if bbw is None or bbw < bb_min:
         _log_blocked("range_squeeze_bbw", f"tf={tf_min} bbw={bbw}")
         return False
 
-    slope = ema_slope_norm(closes, period=21, lookback=SLOPE_LOOKBACK)
     if slope is None or slope < slope_min:
         _log_blocked("ema_flat_slope", f"tf={tf_min} slope={slope}")
         return False
 
     return True
+
+
+def passes_all_regime_filters(tf_min: int, velas: List[Dict[str, Any]]) -> bool:
+    """Verifica todos os filtros de regime de forma unificada.
+
+    M1: aplica regra "3 de 4" combinando ATR + ADX + BBW + SLOPE internamente
+        em passes_trend_strength_filter. Não chama passes_atr_filter separado.
+    M5: mantém comportamento original — ATR e trend_strength são filtros rígidos.
+    """
+    if tf_min == 1:
+        # ATR já está integrado na regra 3-de-4 dentro de passes_trend_strength_filter
+        return passes_trend_strength_filter(tf_min, velas)
+    # M5: todos os filtros são obrigatórios
+    return passes_atr_filter(tf_min, velas) and passes_trend_strength_filter(tf_min, velas)
 
 
 # =========================
@@ -879,26 +928,30 @@ def is_harami_bullish(prev_c, cur_c) -> bool:
 # =========================
 
 # --- Parâmetros fixos do motor V15 (bloco centralizado, não dispersar) ---
-# Nota rigidez: M5 normal=80 | M5 rígida≈82 | M1 normal≈80 | M1 extra-rígida=90
-V15_SCORE_MIN = 80           # Score mínimo para sinal reversal V15 (0–100); ajustado por _apply_rigidez()
-V15_SCORE_GAP_MIN = 10       # Diferença mínima exigida entre call_score e put_score (evita empates técnicos)
-V15_CONFIRM_POLLS = 3        # Polls consecutivos de confirmação sustentada necessários
+# Nota rigidez: M5 normal=80 | M5 rígida≈82 | M1 normal≈76 | M1 extra-rígida=90
+V15_SCORE_MIN = 76           # Score mínimo para sinal reversal V15 (0–100); ajustado por _apply_rigidez()
+V15_SCORE_GAP_MIN = 6        # Diferença mínima exigida entre call_score e put_score (evita empates técnicos)
+V15_CONFIRM_POLLS = 1        # Polls consecutivos de confirmação sustentada necessários (M1 ágil)
 V15_RSI_PERIOD = 14          # Período RSI
 V15_RSI_OVERSOLD = 30        # RSI abaixo deste valor = oversold → sinal call
 V15_RSI_OVERBOUGHT = 70      # RSI acima deste valor = overbought → sinal put
 V15_BB_PERIOD = 20           # Período Bollinger Bands
 V15_BB_STD = 2.0             # Multiplicador de desvio padrão para BB
-V15_BB_PROXIMITY = 0.20      # Fração da largura da banda para considerar "próximo do extremo"
+V15_BB_PROXIMITY = 0.25      # Fração da largura da banda para considerar "próximo do extremo" (mais permissivo)
 V15_IMPULSE_LOOKBACK = 5     # Número de velas para cálculo de impulso (tendência recente)
 V15_CONTEXT_LOOKBACK = 12    # Número de velas para contexto de tendência prévia
 V15_WICK_RATIO = 0.45        # Wick mínimo (wick/range) para pontuar sombra longa
 V15_CANDLES_NEEDED = 40      # Mínimo de velas para o motor V15 funcionar
 # Thresholds internos do motor (ajustáveis para calibração fina)
 V15_TREND_THRESHOLD = 0.0008   # Variação mínima relativa para considerar tendência (não sideways)
-V15_IMPULSE_THRESHOLD = 0.001  # Variação mínima relativa de impulso para pontuar contexto
+V15_IMPULSE_THRESHOLD = 0.0008 # Variação mínima relativa de impulso para pontuar contexto (mais sensível)
 V15_IMPULSE_MULTIPLIER = 8000  # Fator de escala: impulso*fator → pontos (capado em 25)
 V15_WICK_SCORE_MAX = 25        # Pontuação máxima por componente wick
 V15_WICK_SCORE_FACTOR = 35     # Fator multiplicador: wick_ratio*fator → pontos brutos
+# Fallback condicional M1: permite Harami/Hammer no M1 somente se o V15 estiver
+# "quase passando" (score próximo do mínimo + contexto estrutural OK).
+# Evita fallback puro sem contexto V15. Ajuste a critério: 55 = ~72% do mínimo.
+V15_FALLBACK_NEAR_SCORE_M1 = 55  # Score mínimo para ativar fallback Harami/Hammer no M1
 
 # =========================
 # FILTRO ESTRUTURAL M5 (v15.1)
@@ -1241,9 +1294,15 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
         }
 
     # ── Fallback v14: Harami Bearish / Bullish / Hammer ───────────────────
-    # No M1: fallback só é permitido se passar pelo filtro estrutural leve.
-    # No M5: fallback puro sem filtro estrutural adicional.
+    # No M5: fallback puro sem filtro adicional.
+    # No M1: fallback condicional — só ativo se V15 "quase passou" (quase-score)
+    #         e estrutura OK. Evita entradas sem contexto reversal mínimo.
+    _best_score = max(call_score, put_score)
+    _fallback_m1_ok = (tf_min != 1) or (_best_score >= V15_FALLBACK_NEAR_SCORE_M1)
+
     if is_harami_bearish(c_prev, c_last):
+        if not _fallback_m1_ok:
+            return None
         if tf_min == 1 and not _m1_structural_filter("put", velas):
             return None
         return {
@@ -1258,6 +1317,8 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
             **_score_components,
         }
     if is_harami_bullish(c_prev, c_last):
+        if not _fallback_m1_ok:
+            return None
         if tf_min == 1 and not _m1_structural_filter("call", velas):
             return None
         return {
@@ -1272,6 +1333,8 @@ def check_patterns(tf_min: int, velas: List[Dict[str, Any]]) -> Optional[Dict[st
             **_score_components,
         }
     if is_hammer(c_last):
+        if not _fallback_m1_ok:
+            return None
         if tf_min == 1 and not _m1_structural_filter("call", velas):
             return None
         return {
@@ -1375,22 +1438,25 @@ def confirm_pending(tf_min: int, pending: Dict[str, Any], velas: List[Dict[str, 
                 return "rejected", None
             return "waiting", None
 
-    # ─── Confirmação fallback v14: harami/hammer (lógica clássica) ────────
+    # ─── Confirmação fallback v14: harami/hammer (lógica aprimorada) ─────
+    # Usa 40% do range como referência em vez do ponto médio (50%),
+    # tornando a confirmação ligeiramente mais permissiva sem perder o critério direcional.
     c_next = _find_candle_by_from(velas, expected_confirm_from)
     if c_next is None:
         return "waiting", None
 
     patt = pending["pattern_name"]
+    rng = float(c_pattern["max"]) - float(c_pattern["min"])
+    bull_level = float(c_pattern["min"]) + (rng * 0.40)   # 40% do range a partir da mínima
+    bear_level = float(c_pattern["max"]) - (rng * 0.40)   # 40% do range a partir da máxima
     if patt == "Hammer":
         ok = float(c_next["close"]) > float(c_pattern["max"])
         return ("confirmed" if ok else "rejected"), ("call" if ok else None)
     if patt == "HaramiBullish":
-        mid = (float(c_pattern["max"]) + float(c_pattern["min"])) / 2.0
-        ok = (float(c_next["close"]) > float(c_next["open"])) and (float(c_next["close"]) > mid)
+        ok = (float(c_next["close"]) > float(c_next["open"])) and (float(c_next["close"]) > bull_level)
         return ("confirmed" if ok else "rejected"), ("call" if ok else None)
     if patt == "HaramiBearish":
-        mid = (float(c_pattern["max"]) + float(c_pattern["min"])) / 2.0
-        ok = (float(c_next["close"]) < float(c_next["open"])) and (float(c_next["close"]) < mid)
+        ok = (float(c_next["close"]) < float(c_next["open"])) and (float(c_next["close"]) < bear_level)
         return ("confirmed" if ok else "rejected"), ("put" if ok else None)
     return "error", None
 
@@ -1647,13 +1713,17 @@ def check_order_result(order_id, amount, saldo_before=None, timeout_seconds=90, 
 # =========================
 # Buy
 # =========================
-def resolve_trade_variant(ativo: str, ativo_chave: str) -> Tuple[str, str]:
+def resolve_trade_variant(ativo: str, ativo_chave: str, use_otc: bool = False) -> Tuple[str, str]:
     """Antes de cada entrada, re-verifica qual mercado usar.
 
     PRIORIZA DIGITAL: verifica se existe variante digital aberta para o ativo.
     Se digital estiver aberto → retorna (nome_digital, 'digital').
     Se digital estiver fechado → retorna a variante binária/original.
     Chama a API a cada invocação (não usa cache) para garantir status atualizado.
+
+    use_otc: passa o modo global de OTC — tem precedência sobre o sufixo do ativo.
+    Se use_otc=False (mercado aberto), NUNCA permite variante -OTC mesmo que o
+    ativo original não tenha sufixo, evitando troca silenciosa por OTC.
     """
     if not PREFER_DIGITAL:
         return ativo, ativo_chave
@@ -1661,7 +1731,8 @@ def resolve_trade_variant(ativo: str, ativo_chave: str) -> Tuple[str, str]:
         ot = API.get_all_open_time()
         # Normalizar base do ativo (strip -OP / -OTC)
         base = _normalize_asset_name(re.sub(r'[-]?(OTC|OP)$', '', ativo.upper()))
-        allow_otc = '-OTC' in ativo.upper()
+        # use_otc global tem precedência: só permite OTC se explicitamente habilitado
+        allow_otc = use_otc
         # Tentar digital primeiro
         digital_table = ot.get('digital', {})
         if isinstance(digital_table, dict):
@@ -1669,7 +1740,7 @@ def resolve_trade_variant(ativo: str, ativo_chave: str) -> Tuple[str, str]:
                 if not (isinstance(info, dict) and info.get('open')):
                     continue
                 # Nunca selecionar OTC se não foi explicitamente configurado
-                if '-OTC' in str(name).upper() and not allow_otc:
+                if 'OTC' in str(name).upper() and not allow_otc:
                     continue
                 name_norm = _normalize_asset_name(str(name))
                 if name_norm == base or name_norm.startswith(base) or base.startswith(name_norm):
@@ -1725,10 +1796,10 @@ def _apply_rigidez():
 
     Diferença de rigidez M1 vs M5:
     ─────────────────────────────
-    M5 NORMAL      : parâmetros padrão (V15_SCORE_MIN=80, ADX_MIN_M5=18, etc.)
+    M5 NORMAL      : parâmetros padrão (V15_SCORE_MIN=76, ADX_MIN_M5=18, etc.)
     M5 RÍGIDA      : ADX +2, BB_WIDTH *1.20, SLOPE *1.25, janela menor
-    M1 CONSERVADOR : V15_SCORE_MIN=80, CONFIRM_POLLS=2, ADX=14, BB_WIDTH=0.00035,
-                     SLOPE=0.00008, janela 5s — modo operacional equilibrado.
+    M1 CONSERVADOR : V15_SCORE_MIN=76, CONFIRM_POLLS=1, ADX=10.5, BB_WIDTH=0.00022,
+                     SLOPE=0.00005, janela 10s — modo operacional com mais entradas.
     M1 EXTRA RÍGIDO: ADX +4, BB_WIDTH *1.35, SLOPE *1.50, janela 4s,
                      V15_SCORE_MIN=90, CONFIRM_POLLS=4 — EXTRA RÍGIDA.
                      Um único sinal por candle M1 (bloqueio por pending_lock_until).
@@ -1736,7 +1807,7 @@ def _apply_rigidez():
     global ADX_MIN_M1, ADX_MIN_M5, BB_WIDTH_MIN_M1, BB_WIDTH_MIN_M5, SLOPE_MIN_M1, SLOPE_MIN_M5
     global ENTRY_WINDOW_SECONDS_M1, ENTRY_WINDOW_SECONDS_M5
     global ATR_ADAPTIVE_FACTOR
-    global V15_SCORE_MIN, V15_CONFIRM_POLLS
+    global V15_SCORE_MIN, V15_CONFIRM_POLLS, V15_SCORE_GAP_MIN
     if RIGIDEZ_MODE != "rigida":
         return
     ADX_MIN_M5 += 2.0
@@ -1753,15 +1824,17 @@ def _apply_rigidez():
             ENTRY_WINDOW_SECONDS_M1 = min(ENTRY_WINDOW_SECONDS_M1, 4)
             ATR_ADAPTIVE_FACTOR = max(ATR_ADAPTIVE_FACTOR, 0.90)
             V15_SCORE_MIN = 90       # Score mínimo mais alto para M1 extra rígido
+            V15_SCORE_GAP_MIN = 10   # Gap mais exigente no modo extra rígido
             V15_CONFIRM_POLLS = 4    # Mais polls de confirmação para M1 extra rígido
         else:
-            # M1 conservador: parâmetros equilibrados para uso operacional
-            ADX_MIN_M1 = 14.0
-            BB_WIDTH_MIN_M1 = 0.00035
-            SLOPE_MIN_M1 = 0.00008
-            ENTRY_WINDOW_SECONDS_M1 = 5
-            V15_SCORE_MIN = 80       # Score padrão — mais entradas mantendo qualidade
-            V15_CONFIRM_POLLS = 2    # Confirmação rápida adequada ao M1
+            # M1 conservador: parâmetros operacionais para entrar mais com segurança
+            ADX_MIN_M1 = 10.5
+            BB_WIDTH_MIN_M1 = 0.00022
+            SLOPE_MIN_M1 = 0.00005
+            ENTRY_WINDOW_SECONDS_M1 = 10
+            V15_SCORE_MIN = 76       # Score mais leve — mais entradas mantendo qualidade
+            V15_SCORE_GAP_MIN = 6    # Gap mínimo menor para M1 conservador
+            V15_CONFIRM_POLLS = 1    # Confirmação rápida para não perder timing no M1
     else:
         ADX_MIN_M1 += 2.0
         BB_WIDTH_MIN_M1 *= 1.20
@@ -1900,6 +1973,56 @@ def build_candidate_pool(use_otc: bool, limit: int = 200) -> List[Tuple[str, str
     return build_asset_list(use_otc=use_otc, max_count=limit)
 
 
+def rank_assets_by_regime(
+    candidates: List[Tuple[str, str]],
+    tf_min: int,
+    top_n: int = 4,
+) -> List[Tuple[str, str]]:
+    """Ranqueia ativos por qualidade de regime (ATR + ADX + BBW) e retorna os top_n.
+
+    Usado no M1 para selecionar dinamicamente os ativos mais promissores a cada
+    ciclo de re-ranking, reduzindo tempo gasto em ativos laterais/comprimidos.
+
+    Estratégia de pontuação (normalizado pelo mínimo exigido):
+      score = atr_ratio/ATR_MIN + adx/ADX_MIN + bbw/BB_MIN
+    Quanto maior o score, melhor o regime do ativo naquele momento.
+    """
+    scored: List[Tuple[float, str, str]] = []
+    for ativo, cat in candidates:
+        try:
+            period = tf_min * 60
+            # Busca poucos candles para ranking rápido (não precisa de lookback completo)
+            velas = get_candles_safe(ativo, period, 50)
+            if not velas or len(velas) < 20:
+                scored.append((0.0, ativo, cat))
+                continue
+
+            closes = [float(v["close"]) for v in velas]
+            if not closes:
+                scored.append((0.0, ativo, cat))
+                continue
+
+            atr = calculate_atr_from_candles(velas, periodo=ATR_PERIOD)
+            mean_close = (sum(closes[-ATR_PERIOD:]) / ATR_PERIOD
+                          if len(closes) >= ATR_PERIOD else closes[-1])
+            atr_score = (atr / mean_close / max(ATR_MIN_RATIO_ABS_M1, 1e-12)
+                         if (atr and mean_close > 0) else 0.0)
+
+            adx = adx_from_candles(velas, period=ADX_PERIOD) or 0.0
+            adx_score = adx / max(ADX_MIN_M1, 1e-3)
+
+            bbw = bb_width_norm(closes, period=BB_PERIOD, std_mult=BB_STD) or 0.0
+            bbw_score = bbw / max(BB_WIDTH_MIN_M1, 1e-12)
+
+            score = atr_score + adx_score + bbw_score
+            scored.append((score, ativo, cat))
+        except Exception:
+            scored.append((0.0, ativo, cat))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(ativo, cat) for _, ativo, cat in scored[:top_n]]
+
+
 def ask_market_type() -> bool:
     """Pergunta tipo de mercado. Retorna True para OTC, False para Mercado Aberto (-OP)."""
     print("\n" + "=" * 70)
@@ -1971,8 +2094,9 @@ def ask_m1_profile():
     print("\n" + "=" * 70)
     print("⚙️  PERFIL M1")
     print("=" * 70)
-    print("  1) M1 Conservador  ✅  (operacional — mais entradas, filtros equilibrados)")
-    print("     Score=84, Polls=2, ADX=18, BB=0.00050, Slope=0.00009, Janela=5s")
+    print("  1) M1 Conservador  ✅  (operacional — mais entradas, filtros turbo)")
+    print("     Score=76, Polls=1, ADX=10.5, BB=0.00022, Slope=0.00005, Janela=10s")
+    print("     Filtro 3-de-4, cap ATR=0.00014, ranking top 4 ativos dinâmico")
     print("  2) M1 Extra Rígido 🔬  (laboratório/apresentação — muito seletivo)")
     print("     Score=90, Polls=4, ADX+4, BB×1.35, Slope×1.50, Janela=4s")
     while True:
@@ -2381,7 +2505,7 @@ def loop_patterns(ativo: str, ativo_chave: str, tf_min: int, runtime_seconds: Op
             time.sleep(IDLE_SLEEP_S_M5 if tf_min == 5 else IDLE_SLEEP_S_M1)
             continue
 
-        if not passes_atr_filter(tf_min, velas) or not passes_trend_strength_filter(tf_min, velas):
+        if not passes_all_regime_filters(tf_min, velas):
             time.sleep(IDLE_SLEEP_S_M5 if tf_min == 5 else IDLE_SLEEP_S_M1)
             continue
 
@@ -2572,7 +2696,12 @@ def loop_patterns_multi(
 
     period = tf_min * 60
     expiration = tf_min
-    _max_ativos = max_ativos if max_ativos > 0 else len(ativos)
+    # M1: limita automaticamente a no máximo 4 ativos simultâneos para melhor foco
+    _m1_max_ativos = 4
+    if tf_min == 1:
+        _max_ativos = min(max_ativos, _m1_max_ativos) if max_ativos > 0 else _m1_max_ativos
+    else:
+        _max_ativos = max_ativos if max_ativos > 0 else len(ativos)
 
     # Temporizador de finalização automática
     end_time: Optional[float] = (time.time() + run_minutes * 60) if run_minutes > 0 else None
@@ -2622,20 +2751,67 @@ def loop_patterns_multi(
 
     # Controle do recheck por candle
     last_recheck_cid: int = -1
+    # Controle de re-ranking para M1 (a cada 5 minutos)
+    M1_RANK_INTERVAL_S = 300  # re-rankeia ativos M1 a cada 5 minutos
+    _last_m1_rank_ts: float = 0.0
 
     def _refill_pool(now_cid: int) -> None:
-        """Re-verifica o pool completo e adiciona ativos disponíveis."""
-        nonlocal last_recheck_cid
+        """Re-verifica o pool completo e adiciona ativos disponíveis.
+
+        Para M1: aplica ranking por ATR+ADX+BBW a cada M1_RANK_INTERVAL_S segundos,
+        mantendo apenas os ativos com melhor regime de mercado no pool ativo.
+        """
+        nonlocal last_recheck_cid, active_ativos, _last_m1_rank_ts
         if now_cid == last_recheck_cid:
             return
         last_recheck_cid = now_cid
 
-        active_names = {a.upper() for a, _ in active_ativos}
         try:
             candidates = build_candidate_pool(use_otc=use_otc)
         except Exception as exc:
             _log_error("Falha ao buscar pool de candidatos em _refill_pool.", exc)
             return
+
+        if tf_min == 1:
+            # M1: re-ranking periódico — seleciona top _max_ativos por qualidade de regime
+            now_t = time.time()
+            if now_t - _last_m1_rank_ts >= M1_RANK_INTERVAL_S or not active_ativos:
+                _last_m1_rank_ts = now_t
+                # Preserva ativos com pending ativo no ranking para não cortar sinais em andamento
+                pending_ativos = {a for a, _ in active_ativos
+                                  if per_asset_pending.get(a) is not None}
+                ranked = rank_assets_by_regime(candidates, tf_min, top_n=_max_ativos + len(pending_ativos))
+                ranked_names = {a.upper() for a, _ in ranked}
+                # Remove ativos sem ranking (e sem pending) do pool
+                removed = [a for a, _ in active_ativos
+                           if a.upper() not in ranked_names and a not in pending_ativos]
+                if removed:
+                    active_ativos = [(a, c) for a, c in active_ativos if a not in removed]
+                    console_event(
+                        f"🔄 Re-ranking M1: removidos do pool: "
+                        + ", ".join(display_asset_name(a) for a in removed)
+                    )
+                # Adiciona ativos do ranking que ainda não estão no pool
+                active_names = {a.upper() for a, _ in active_ativos}
+                added = []
+                for candidate, cat in ranked:
+                    if len(active_ativos) >= _max_ativos:
+                        break
+                    if candidate.upper() in active_names:
+                        continue
+                    active_ativos.append((candidate, cat))
+                    _init_asset_state(candidate)
+                    active_names.add(candidate.upper())
+                    added.append(candidate)
+                if added:
+                    console_event(
+                        f"➕ Re-ranking M1: adicionados ao pool: "
+                        + ", ".join(display_asset_name(a) for a in added)
+                    )
+                return
+
+        # M5 (ou M1 fora do intervalo de ranking): preenchimento normal sem ranking
+        active_names = {a.upper() for a, _ in active_ativos}
         added = []
         for candidate, cat in candidates:
             if len(active_ativos) >= _max_ativos:
@@ -2736,7 +2912,7 @@ def loop_patterns_multi(
             if not velas or len(velas) < MIN_CANDLES_REQUIRED:
                 continue
 
-            if not passes_atr_filter(tf_min, velas) or not passes_trend_strength_filter(tf_min, velas):
+            if not passes_all_regime_filters(tf_min, velas):
                 continue
 
             if pend is not None and pend_id is not None:
@@ -2789,8 +2965,8 @@ def loop_patterns_multi(
                     amount_to_use = compute_amount(saldo_before)
                     secs_left = seconds_left_in_period(tf_min)
 
-                    # Re-verificar digital/binária antes de cada entrada
-                    trade_ativo, trade_chave = resolve_trade_variant(ativo, ativo_chave)
+                    # Re-verificar digital/binária antes de cada entrada (respeitando modo OTC)
+                    trade_ativo, trade_chave = resolve_trade_variant(ativo, ativo_chave, use_otc=use_otc)
                     market_type_label = "DIGITAL" if trade_chave == 'digital' else "BINÁRIA"
 
                     console_event(
@@ -2828,11 +3004,11 @@ def loop_patterns_multi(
                             console_event(
                                 f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] Falha ao enviar ordem."
                             )
-                        # Se falhou no digital, tentar binária como fallback
+                        # Se falhou no digital, tentar binária como fallback (respeitando modo OTC)
                         if trade_chave == 'digital':
                             fb_name, fb_chave = find_preferred_variant_with_rules(
                                 _normalize_asset_name(re.sub(r'[-]?(OTC|OP)$', '', ativo.upper())),
-                                allow_otc='-OTC' in ativo.upper()
+                                allow_otc=use_otc
                             )
                             if fb_name and fb_chave and fb_chave != 'digital':
                                 fb_container: Dict[str, Any] = {}
