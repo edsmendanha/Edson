@@ -86,6 +86,16 @@ nome real da IQ Option ao buscar no book digital:
 > **Nota:** `BXY` e `CXY` já são os nomes canônicos da API IQ Option — escreva-os
 > diretamente em `favoritos.txt` ou use os aliases acima.
 
+### 1b. Filtragem de ativos por tipo de mercado
+
+O book inicial é filtrado rigorosamente conforme o mercado selecionado:
+
+- **Mercado Aberto**: inclui somente ativos `-OP` e índices sem sufixo. Ativos com `-OTC`
+  em qualquer parte do nome (ex: `BTCUSD-OTC-OP`) são **sempre excluídos**.
+- **Mercado OTC**: inclui somente ativos com `-OTC` no nome. Ativos `-OP` não são incluídos.
+
+Essa filtragem elimina a possibilidade de um ativo OTC aparecer misturado no book de Mercado Aberto.
+
 ### 2. Timeframe Selecionável: M1 ou M5
 
 - Menu de seleção de timeframe ao iniciar o bot.  
@@ -139,6 +149,7 @@ Complementa o motor V15 no timeframe M1 com localização estrutural no **micro-
 - **PUT**: aceito somente se o fechamento da vela de sinal está no **1/3 superior** do micro-range → zona de resistência recente
 - Sinais no **meio do range** são descartados automaticamente (zonas ruidosas)
 - Se não houver velas suficientes, o filtro não bloqueia (fail-safe)
+- **Fallback M1**: os padrões Harami e Hammer também passam por este filtro no M1. Fallback sem filtro estrutural só é permitido no M5.
 
 Este filtro melhora a qualidade das entradas M1 sem precisar endurecer os filtros quantitativos.
 
@@ -193,9 +204,34 @@ Arquivos de log (pasta `logs/`):
 |---------|----------|
 | `trades_log_<tag>.csv` | Cada operação: ativo, direção, resultado, lucro, tipo (digital/binary) |
 | `latency_log_<tag>.csv` | Latência de cada compra |
-| `patterns_log_<tag>.csv` | Sinais detectados e confirmados |
+| `patterns_log_<tag>.csv` | Sinais detectados/confirmados com componentes de score detalhados |
 | `blocked_reasons_<tag>.log` | Motivos de bloqueio (ATR baixo, ADX fraco, etc.) |
 | `runtime_errors_<tag>.log` | Erros em tempo de execução |
+
+#### Colunas do `patterns_log_<tag>.csv`
+
+| Coluna | Descrição |
+|--------|-----------|
+| `ts_iso` | Timestamp ISO 8601 do evento |
+| `instance_tag` | Tag da instância do bot |
+| `ativo` | Nome do ativo |
+| `tf_min` | Timeframe em minutos (1 ou 5) |
+| `event` | Tipo de evento: `detected`, `confirmed`, `expired`, `rejected`, `error` |
+| `pattern_name` | Nome do padrão detectado (ex: `ReversalV15_CALL`, `HaramiBearish`) |
+| `pattern_mode` | Origem do padrão: `v15` (motor principal) ou `fallback` (Harami/Hammer) |
+| `pattern_from` | Timestamp de abertura da vela de sinal |
+| `expected_confirm_from` | Timestamp esperado de início da confirmação |
+| `direction_hint` | Direção prevista: `call` ou `put` |
+| `confirmed` | `1` se confirmado, `0` caso contrário |
+| `confirm_from` | Timestamp de início da confirmação (se confirmado) |
+| `rsi_pts` | Pontuação RSI contribuída para o score (0–25) |
+| `bb_pts` | Pontuação Bollinger Bands contribuída (0–25) |
+| `wick_pts` | Pontuação Wick (sombra) contribuída (0–25) |
+| `imp_pts` | Pontuação Impulso+Contexto contribuída (0–25) |
+| `call_score` | Score total da direção CALL |
+| `put_score` | Score total da direção PUT |
+| `block_reason` | Motivo do bloqueio, se aplicável (ex: `expired`, `rejected`) |
+| `details` | Informações adicionais opcionais |
 
 ### 8. Stops Globais
 
@@ -216,11 +252,13 @@ O bot usa um sistema de **score composto (0–100 pontos)**:
 | Wick (sombra longa) | 0–25 | Sombra inferior → CALL, sombra superior → PUT |
 | Impulso + Contexto | 0–25 | Downtrend+queda recente → CALL, Uptrend+alta recente → PUT |
 
-- **Sinal disparado** quando score ≥ `V15_SCORE_MIN` e direção vencedora supera a oposta.  
+- **Sinal disparado** quando score ≥ `V15_SCORE_MIN` **E** a diferença entre o score vencedor e o oposto ≥ `V15_SCORE_GAP_MIN` (padrão: **10 pontos**). Isso evita entradas baseadas em empates técnicos:
+  - call=85, put=84 → diferença = 1 → **não entra** (abaixo do gap mínimo)
+  - call=90, put=75 → diferença = 15 → **entra** (acima do gap mínimo, sinal confiável)
 - **Confirmação**: V15_CONFIRM_POLLS polls consecutivos confirmando a direção.  
-- **Fallback v14**: Harami Bearish/Bullish e Hammer quando V15 não atinge pontuação mínima.  
+- **Fallback v14**: Harami Bearish/Bullish e Hammer quando V15 não atinge pontuação mínima. No M1, fallback também exige aprovação pelo filtro estrutural.  
 - **Filtro estrutural M5**: sinal M5 só é aceito se a vela candidata estiver no extremo do range (20% mais baixo para CALL, 20% mais alto para PUT).  
-- **Filtro estrutural M1**: sinal M1 só é aceito se a vela candidata estiver no 1/3 inferior (CALL) ou 1/3 superior (PUT) do micro-range das últimas 8 velas.  
+- **Filtro estrutural M1**: sinal M1 só é aceito se a vela candidata estiver no 1/3 inferior (CALL) ou 1/3 superior (PUT) do micro-range das últimas 8 velas. Aplicado também ao fallback no M1.  
 - **Confirmação M1 com margem ATR**: no timeframe M1, a confirmação V15 usa buffer `ATR × 0.1` para filtrar ruído de micro-oscilação.
 
 ---
@@ -256,6 +294,7 @@ GBPUSD-OP
 | `PREFER_DIGITAL` | `True` | Prioriza mercado digital |
 | `MAX_ENTRIES` | `0` | Definido no menu (0 = ilimitado) |
 | `V15_SCORE_MIN` | `80` | Score mínimo M5 (84 para M1 conservador, 90 para M1 extra rígido) |
+| `V15_SCORE_GAP_MIN` | `10` | Diferença mínima entre call_score e put_score para validar sinal V15 |
 | `CANDLES_LOOKBACK` | `320` | Candles buscados por ciclo |
 | `MIN_CANDLES_REQUIRED` | `120` | Mínimo para análise |
 | `PURCHASE_BUFFER_SECONDS` | `8` | Buffer antes do fechamento do candle |
@@ -267,4 +306,5 @@ GBPUSD-OP
 
 ## Versão
 
-`2026-03-25-m1m5-digital-v3`
+`2026-03-25-m1m5-digital-v4`
+
