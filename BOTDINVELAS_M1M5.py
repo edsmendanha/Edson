@@ -1832,6 +1832,7 @@ def _apply_rigidez():
             BB_WIDTH_MIN_M1 = 0.00022
             SLOPE_MIN_M1 = 0.00005
             ENTRY_WINDOW_SECONDS_M1 = 10
+            ATR_ADAPTIVE_FACTOR = 0.45   # Restaura fator leve para M1 conservador (desfaz max 0.85 acima)
             V15_SCORE_MIN = 76       # Score mais leve — mais entradas mantendo qualidade
             V15_SCORE_GAP_MIN = 6    # Gap mínimo menor para M1 conservador
             V15_CONFIRM_POLLS = 1    # Confirmação rápida para não perder timing no M1
@@ -2040,20 +2041,20 @@ def ask_market_type() -> bool:
 
 
 def ask_num_assets() -> int:
-    """Pergunta quantos ativos operar simultaneamente (1 a 8)."""
+    """Pergunta quantos ativos operar simultaneamente (1 a 4)."""
     print("\n" + "=" * 70)
     print("📊 NÚMERO DE ATIVOS SIMULTÂNEOS")
     print("=" * 70)
-    print("  Escolha quantos ativos operar ao mesmo tempo (1 a 8).")
+    print("  Escolha quantos ativos operar ao mesmo tempo (1 a 4).")
     while True:
-        r = input("\n👉 Digite um número de 1 a 8 [4]: ").strip() or "4"
+        r = input("\n👉 Digite um número de 1 a 4 [4]: ").strip() or "4"
         try:
             n = int(r)
-            if 1 <= n <= 8:
+            if 1 <= n <= 4:
                 return n
         except Exception:
             pass
-        print("❌ Digite um número entre 1 e 8.")
+        print("❌ Digite um número entre 1 e 4.")
 
 
 def ask_time_hhmm(prompt):
