@@ -57,12 +57,34 @@ O bot exibe um menu interativo completo ao iniciar.
 ### 1. Prioridade Digital → Binária
 
 - **Sempre tenta DIGITAL primeiro** antes de cada entrada.  
-- Se o mercado digital estiver fechado, cai automaticamente para **BINÁRIA**.  
+- A lista inicial de ativos já é montada priorizando **todos os digitais abertos**, incluindo
+  índices como **Dollar Index (DXY), CXY (Canadian Dollar Index), BXY (Pound Index)** e
+  quaisquer outros que a API IQ Option disponibilize na categoria `'digital'`.
+- Índices e ativos sem sufixo `-OTC`/`-OP` que existam somente no book digital **sempre entram como digital**.  
+- **Binária só é adicionada** se não houver equivalente digital aberto para o ativo.  
+- Nenhum ativo aparece duplicado: cada par é listado **uma única vez**, sempre como digital quando possível.  
+- Se o mercado digital estiver fechado, cai automaticamente para **BINÁRIA** como fallback.  
 - **Antes de cada entrada**, o status digital/binária é re-verificado via API (sem cache).  
 - Se a digital reabrir durante a sessão, o bot volta a usá-la automaticamente.  
 - Usa `API.buy_digital_spot_v2()` para digital e `API.buy()` para binária.  
 - Se a ordem digital falhar, tenta fallback para binária automaticamente.  
 - Controlado pelo flag global `PREFER_DIGITAL = True`.
+
+### 1a. Aliases para nomes de ativos
+
+O bot aceita abreviações populares em `favoritos.txt` e as resolve automaticamente para o
+nome real da IQ Option ao buscar no book digital:
+
+| Alias (favoritos.txt) | Nome real na IQ Option |
+|-----------------------|------------------------|
+| `DXY`                 | Dollar Index           |
+| `POUNDINDEX`          | BXY (nome canônico)    |
+| `DOLLARINDEX`         | Dollar Index           |
+| `GBPINDEX`            | BXY (nome canônico)    |
+| `CANADIANDOLLARINDEX` | CXY (nome canônico)    |
+
+> **Nota:** `BXY` e `CXY` já são os nomes canônicos da API IQ Option — escreva-os
+> diretamente em `favoritos.txt` ou use os aliases acima.
 
 ### 2. Timeframe Selecionável: M1 ou M5
 
