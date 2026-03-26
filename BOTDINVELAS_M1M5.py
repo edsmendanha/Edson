@@ -55,6 +55,7 @@ STATE_DIR = BASE_DIR / 'state'
 PRESETS_DIR = BASE_DIR / 'presets'
 STATE_PATH = STATE_DIR / 'bot_state.json'
 FAVORITES_FILE = BASE_DIR / 'favoritos.txt'
+ATIVOS_FILE = BASE_DIR / 'Ativos.txt'
 
 INSTANCE_TAG = "unset"
 
@@ -1869,135 +1870,166 @@ def ask_yes_no(prompt):
 
 
 # =========================
-# FAVORITOS / LISTA DE ATIVOS
+# ATIVOS / LISTA DE ATIVOS (Ativos.txt)
 # =========================
-def load_favorites() -> List[str]:
-    """Lê favoritos.txt (um ativo por linha). Linhas com # são comentários."""
-    favs: List[str] = []
+def load_ativos_por_categoria(tf_min: int) -> Tuple[List[str], List[str]]:
+    """Lê Ativos.txt e retorna (lista_digital, lista_binaria) para o timeframe tf_min.
+
+    Formato esperado:
+        [DIGITAL M1]
+        EURUSD-OP
+        EURJPY-OP
+        EURGBP-OTC
+
+        [BINARIA M1]
+        EURUSD-OP
+        ...
+
+    tf_min: 1 para M1, 5 para M5, 15 para M15, etc.
+    Linhas vazias e linhas com # são ignoradas.
+    -OP e -OTC podem ser misturados em qualquer seção.
+
+    Retorna ([], []) se o arquivo não existir, se ocorrer erro na leitura,
+    ou se não houver seções correspondentes ao tf_min informado.
+    """
+    tf_label = f"M{tf_min}"
+    digital_section = f"DIGITAL {tf_label}"
+    binaria_section = f"BINARIA {tf_label}"
+
+    digital: List[str] = []
+    binaria: List[str] = []
+    current_section: Optional[str] = None
+
     try:
-        if FAVORITES_FILE.exists():
-            with FAVORITES_FILE.open('r', encoding='utf-8') as f:
+        if ATIVOS_FILE.exists():
+            with ATIVOS_FILE.open('r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith('#'):
                         continue
-                    favs.append(_normalize_asset_name(line))
+                    if line.startswith('[') and line.endswith(']'):
+                        section = line[1:-1].upper().strip()
+                        if section == digital_section:
+                            current_section = 'digital'
+                        elif section == binaria_section:
+                            current_section = 'binaria'
+                        else:
+                            current_section = None
+                        continue
+                    if current_section == 'digital':
+                        digital.append(_normalize_asset_name(line))
+                    elif current_section == 'binaria':
+                        binaria.append(_normalize_asset_name(line))
     except Exception:
         pass
-    return favs
+
+    return digital, binaria
 
 
 def build_asset_list(use_otc: bool, max_count: int, tf_min: int = 0) -> List[Tuple[str, str]]:
-    """Monta lista de (ativo, categoria) priorizando DIGITAL e depois binária.
+    """Monta lista de (ativo, categoria) baseada exclusivamente no Ativos.txt.
 
-    1. Busca PRIMEIRO todos os ativos abertos na categoria 'digital' que aceitam
-       o timeframe tf_min (M1 ou M5). Índices sem sufixo (CXY, BXY, etc.) inclusos.
-    2. Adiciona ativos 'binary' abertos que aceitam tf_min SOMENTE se não houver
-       digital equivalente (prioridade digital total).
-    3. Nunca duplica: cada ativo aparece apenas uma vez (sempre preferindo digital).
-    4. Prioriza favoritos.txt (com suporte a aliases para abreviações populares).
-    5. Completa com outros ativos abertos do tipo até max_count.
+    Lógica:
+    1. Lê seções [DIGITAL Mx] e [BINARIA Mx] do Ativos.txt para o timeframe escolhido.
+    2. Prioriza ativos da seção DIGITAL que estejam abertos na IQ Option.
+    3. Completa slots restantes com ativos da seção BINARIA abertos (fallback).
+    4. Nunca inclui ativo que não esteja no Ativos.txt.
+    5. Nunca duplica: cada ativo aparece apenas uma vez (digital preferido).
 
-    Parâmetro tf_min: 1=M1, 5=M5, 0=sem filtro de timeframe.
-    ← PONTO-CHAVE: checagem de timeframe garante que apenas ativos com M1/M5
-       aberto entram no pool, evitando seleção de ativos só disponíveis em M15.
+    Retorna lista vazia se nenhum ativo da lista estiver aberto — o chamador
+    deve exibir aviso e aguardar.
+
+    Parâmetro tf_min: 1=M1, 5=M5. Se 0, usa M1 como padrão para leitura do arquivo
+    (o filtro de timeframe da API ainda é desativado quando tf_min=0).
     """
     try:
         ot = API.get_all_open_time()
     except Exception:
         return []
 
+    _tf = tf_min if tf_min > 0 else 1
+    digital_lista, binaria_lista = load_ativos_por_categoria(_tf)
+
     def _has_no_market_suffix(name_u: str) -> bool:
-        """Retorna True se o ativo não tem sufixo -OTC ou -OP (ex: índices como CXY, Dollar Index)."""
         return '-OTC' not in name_u and '-OP' not in name_u
 
-    open_assets: List[Tuple[str, str]] = []
-    seen: set = set()
+    def _passes_market_filter(name_u: str) -> bool:
+        if use_otc:
+            return '-OTC' in name_u or _has_no_market_suffix(name_u)
+        else:
+            return ('-OP' in name_u or _has_no_market_suffix(name_u)) and '-OTC' not in name_u
 
-    # 1ª passagem: DIGITAL tem prioridade total — apenas com tf_min aceito
+    # Constrói mapa de ativos abertos: normalized_name → (real_name, categoria)
+    # Digital tem prioridade; binária entra apenas se não houver digital equivalente
+    open_map: Dict[str, Tuple[str, str]] = {}
+
     digital_table = ot.get('digital', {})
     if isinstance(digital_table, dict):
         for name, info in digital_table.items():
             if not (isinstance(info, dict) and info.get('open')):
                 continue
-            # ← Checagem de timeframe: descarta digital sem M1/M5 disponível
             if tf_min > 0 and not _asset_accepts_tf(info, tf_min):
                 continue
             name_u = str(name).upper()
-            if name_u in seen:
+            if not _passes_market_filter(name_u):
                 continue
-            # Inclui se: sufixo correto para o tipo OU índice sem sufixo (sempre digital)
-            if use_otc:
-                if '-OTC' in name_u or _has_no_market_suffix(name_u):
-                    open_assets.append((name, 'digital'))
-                    seen.add(name_u)
-            else:
-                # Mercado Aberto: exclui explicitamente qualquer ativo com -OTC no nome
-                if ('-OP' in name_u or _has_no_market_suffix(name_u)) and '-OTC' not in name_u:
-                    open_assets.append((name, 'digital'))
-                    seen.add(name_u)
+            norm = _normalize_asset_name(name)
+            if norm not in open_map:
+                open_map[norm] = (name, 'digital')
 
-    # 2ª passagem: binária apenas para ativos SEM equivalente digital — apenas com tf_min aceito
     binary_table = ot.get('binary', {})
     if isinstance(binary_table, dict):
         for name, info in binary_table.items():
             if not (isinstance(info, dict) and info.get('open')):
                 continue
-            # ← Checagem de timeframe: descarta binária sem M1/M5 disponível
             if tf_min > 0 and not _asset_accepts_tf(info, tf_min):
                 continue
             name_u = str(name).upper()
-            if name_u in seen:
+            if not _passes_market_filter(name_u):
                 continue
-            if use_otc:
-                if '-OTC' in name_u:
-                    open_assets.append((name, 'binary'))
-                    seen.add(name_u)
-            else:
-                # Mercado Aberto: exclui explicitamente qualquer ativo com -OTC no nome
-                if '-OP' in name_u and '-OTC' not in name_u:
-                    open_assets.append((name, 'binary'))
-                    seen.add(name_u)
+            norm = _normalize_asset_name(name)
+            if norm not in open_map:  # digital já tem prioridade
+                open_map[norm] = (name, 'binary')
 
-    # Mapa nome normalizado -> (name, categoria) para lookup rápido
-    open_map: Dict[str, Tuple[str, str]] = {
-        _normalize_asset_name(n): (n, c) for n, c in open_assets
-    }
-
-    favs = load_favorites()
     result: List[Tuple[str, str]] = []
     used: set = set()
 
-    # 1ª passagem: favoritos abertos (na ordem do arquivo, com suporte a aliases)
-    for fav in favs:
+    # 1ª passagem: ativos da lista DIGITAL do Ativos.txt que estejam abertos
+    for norm_name in digital_lista:
         if len(result) >= max_count:
             break
-        # Resolve alias: ex. "DXY" → "Dollar Index" → normalizado "DOLLARINDEX"
-        alias_target = ASSET_ALIASES.get(fav)
-        resolved = _normalize_asset_name(alias_target) if alias_target else fav
-        entry = open_map.get(resolved) or open_map.get(fav)
-        if entry and entry[0].upper() not in used:
-            result.append(entry)
-            used.add(entry[0].upper())
+        entry = open_map.get(norm_name)
+        if entry is None:
+            continue
+        real_name, cat = entry
+        if real_name.upper() in used:
+            continue
+        result.append((real_name, cat))
+        used.add(real_name.upper())
 
-    # 2ª passagem: completa com outros ativos abertos do tipo
-    for name, cat in open_assets:
+    # 2ª passagem: completa com ativos da lista BINARIA do Ativos.txt (apenas se faltar)
+    for norm_name in binaria_lista:
         if len(result) >= max_count:
             break
-        if name.upper() not in used:
-            result.append((name, cat))
-            used.add(name.upper())
+        entry = open_map.get(norm_name)
+        if entry is None:
+            continue
+        real_name, cat = entry
+        if real_name.upper() in used:
+            continue
+        result.append((real_name, cat))
+        used.add(real_name.upper())
 
     return result
 
 
 def build_candidate_pool(use_otc: bool, limit: int = 200, tf_min: int = 0) -> List[Tuple[str, str]]:
-    """Retorna todos os candidatos disponíveis (favoritos primeiro, depois resto do book).
+    """Retorna todos os candidatos disponíveis exclusivamente do Ativos.txt.
 
     Igual a build_asset_list mas com limite generoso para varredura dinâmica.
     Filtra por tf_min quando fornecido — garante que apenas ativos com o
     timeframe correto (M1/M5) entrem no pool de candidatos.
-    Não aplica o limite do usuário — o chamador filtra o que já está ativo.
+    Só inclui ativos listados no Ativos.txt que estejam abertos no momento.
     """
     return build_asset_list(use_otc=use_otc, max_count=limit, tf_min=tf_min)
 
@@ -2756,7 +2788,8 @@ def loop_patterns_multi(
         f"Modo: REVERSÃO | tag={INSTANCE_TAG}"
     )
     for a, ak in active_ativos:
-        console_event(f"  📊 {display_asset_name(a)} ({ak})")
+        cat_label = f"DIGITAL M{tf_min}" if ak == 'digital' else f"BINARIA M{tf_min}"
+        console_event(f"  📊 {display_asset_name(a)} [{cat_label}]")
     if max_entries > 0:
         console_event(f"  🎯 Limite de entradas: {max_entries}")
 
@@ -2814,12 +2847,13 @@ def loop_patterns_multi(
                     active_ativos.append((candidate, cat))
                     _init_asset_state(candidate)
                     active_names.add(candidate.upper())
-                    added.append(candidate)
+                    added.append((candidate, cat))
                 if added:
-                    console_event(
-                        f"➕ Re-ranking M1: adicionados ao pool: "
-                        + ", ".join(display_asset_name(a) for a in added)
+                    cat_str = ", ".join(
+                        f"{display_asset_name(a)} [{'DIGITAL' if c == 'digital' else 'BINARIA'} M{tf_min}]"
+                        for a, c in added
                     )
+                    console_event(f"➕ Re-ranking M{tf_min}: adicionados ao pool: " + cat_str)
                 return
 
         # M5 (ou M1 fora do intervalo de ranking): preenchimento normal sem ranking
@@ -2833,12 +2867,13 @@ def loop_patterns_multi(
             active_ativos.append((candidate, cat))
             _init_asset_state(candidate)
             active_names.add(candidate.upper())
-            added.append(candidate)
+            added.append((candidate, cat))
         if added:
-            console_event(
-                f"➕ Ativos re-incluídos no pool M{tf_min}: "
-                + ", ".join(display_asset_name(a) for a in added)
+            cat_str = ", ".join(
+                f"{display_asset_name(a)} [{'DIGITAL' if c == 'digital' else 'BINARIA'} M{tf_min}]"
+                for a, c in added
             )
+            console_event(f"➕ Ativos re-incluídos no pool M{tf_min}: " + cat_str)
 
     def _replace_asset(failed_ativo: str) -> None:
         """Remove ativo com falha e tenta preencher imediatamente com outro."""
@@ -2863,8 +2898,9 @@ def loop_patterns_multi(
             active_ativos.append((candidate, cat))
             _init_asset_state(candidate)
             active_names.add(candidate.upper())
+            cat_label = f"DIGITAL M{tf_min}" if cat == 'digital' else f"BINARIA M{tf_min}"
             console_event(
-                f"➕ [{display_asset_name(candidate)}] Adicionado como substituto M{tf_min}."
+                f"➕ [{display_asset_name(candidate)}] [{cat_label}] Adicionado como substituto M{tf_min}."
             )
             break
 
@@ -2901,8 +2937,8 @@ def loop_patterns_multi(
 
         if not active_ativos:
             console_event(
-                f"⏸️  Nenhum ativo disponível em M{tf_min} no momento. "
-                "Aguardando abertura de mercado..."
+                f"⏳ Nenhum ativo da lista Ativos.txt está aberto para o timeframe M{tf_min} "
+                "escolhido. Aguardando abertura..."
             )
             idle_sleep = IDLE_SLEEP_S_M5 if tf_min == 5 else IDLE_SLEEP_S_M1
             time.sleep(idle_sleep * EMPTY_POOL_SLEEP_MULTIPLIER)
@@ -3210,13 +3246,20 @@ if __name__ == '__main__':
     RIGIDEZ_MODE = "normal"
     _apply_rigidez()
 
-    # Montar lista de ativos inicial priorizando digital com tf aberto
-    print(f"\n🔍 Buscando ativos DIGITAL {market_label} com M{TIMEFRAME_MINUTES} disponível...")
+    # Montar lista de ativos inicial a partir do Ativos.txt
+    print(f"\n🔍 Buscando ativos do Ativos.txt — seções [DIGITAL M{TIMEFRAME_MINUTES}] e [BINARIA M{TIMEFRAME_MINUTES}]...")
+    digital_lista_init, binaria_lista_init = load_ativos_por_categoria(TIMEFRAME_MINUTES)
+    tf_label_init = f"M{TIMEFRAME_MINUTES}"
+    if not digital_lista_init and not binaria_lista_init:
+        print(
+            f"⚠️  Nenhuma seção [DIGITAL {tf_label_init}] ou [BINARIA {tf_label_init}] "
+            "encontrada no Ativos.txt. Verifique o arquivo."
+        )
     ativos_lista = build_asset_list(use_otc=use_otc, max_count=max_ativos, tf_min=TIMEFRAME_MINUTES)
     if not ativos_lista:
         print(
-            f"⚠️  Nenhum ativo DIGITAL {market_label} com M{TIMEFRAME_MINUTES} aberto agora. "
-            "O bot vai aguardar e tentar a cada ciclo conforme os mercados abrirem."
+            f"⏳ Nenhum ativo da lista Ativos.txt está aberto para o timeframe M{TIMEFRAME_MINUTES} "
+            "escolhido. Aguardando abertura..."
         )
 
     # Inicializar paths de log com tag automática
@@ -3234,12 +3277,13 @@ if __name__ == '__main__':
         print(f'👤 Usuário: {nome}')
     print(f'InstanceTag: {INSTANCE_TAG}')
     print(f'Conta: {"DEMO" if conta == "PRACTICE" else "REAL"} | Mercado: {market_label}')
-    print(f'Timeframe: M{TIMEFRAME_MINUTES} | Modo: REVERSÃO | Estratégia: Prioridade Digital (livre)')
-    print(f'Prioridade: DIGITAL com M{TIMEFRAME_MINUTES} → BINÁRIA (fallback apenas se faltar digital)')
+    print(f'Timeframe: M{TIMEFRAME_MINUTES} | Modo: REVERSÃO | Carteira: Ativos.txt')
+    print(f'Prioridade: [DIGITAL M{TIMEFRAME_MINUTES}] → [BINARIA M{TIMEFRAME_MINUTES}] (fallback apenas se faltar digital aberta)')
     print(f'Ativos: {len(ativos_lista)}/{max_ativos}')
     print('Ativos selecionados:')
     for a, ak in ativos_lista:
-        print(f'  - {display_asset_name(a)} ({ak})')
+        categoria_label = f"DIGITAL M{TIMEFRAME_MINUTES}" if ak == 'digital' else f"BINARIA M{TIMEFRAME_MINUTES}"
+        print(f'  - {display_asset_name(a)} [{categoria_label}]')
     if AMOUNT_MODE == "fixed":
         print(f'Valor por operação: ${AMOUNT_FIXED:.2f} (fixo)')
     else:
