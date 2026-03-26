@@ -17,7 +17,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from configobj import ConfigObj
 from iqoptionapi.stable_api import IQ_Option
 
-BOTDIN_VERSION = "2026-03-25-m1m5-digital-v4"
+BOTDIN_VERSION = "2026-03-26-digital-first-v5"
 
 # =========================
 # CONFIG
@@ -124,7 +124,7 @@ ASSET_ALIASES: Dict[str, str] = {
     "CADINDEX":              "CXY",
 }
 
-PURCHASE_BUFFER_SECONDS = int(config.get('AJUSTES', {}).get('purchase_buffer_seconds', 5))
+PURCHASE_BUFFER_SECONDS = int(config.get('AJUSTES', {}).get('purchase_buffer_seconds', 1))
 
 USE_BUY_THREAD = True
 BUY_LATENCY_AVG = 0.9
@@ -138,36 +138,47 @@ ENTRY_MODE = "reversal"
 TIMEFRAME_MINUTES = 1
 PENDING_EXPIRE_CANDLES = 2
 
+# =====================================================================
+# ESTRATÉGIA: PRIORIDADE DIGITAL — AJUSTE FINO AQUI
+# =====================================================================
+# Todos os parâmetros que impactam volume de entradas estão centralizados
+# neste bloco. Altere SOMENTE aqui; o restante do código lê estas variáveis.
+#
+# Regra de qualidade M1: "2-de-4" — permite até 2 filtros abaixo do mínimo
+# entre ATR, ADX, BBW e SLOPE. Aumenta volume sem abrir mão de todo critério.
+# Para tornar mais rígido: diminua os valores abaixo (ex.: SLOPE 0.00003 → 0.00005).
+# Para tornar mais livre:  aumente ENTRY_WINDOW ou diminua V15_SCORE_MIN ainda mais.
+# =====================================================================
+
 ENABLE_ATR_FILTER = True
 ATR_PERIOD = 14
 ATR_ADAPTIVE_WINDOW = 30
-ATR_ADAPTIVE_FACTOR = 0.45        # Fator adaptativo mais leve para M1 (menos pressão no thr)
+ATR_ADAPTIVE_FACTOR = 0.45        # Fator adaptativo para M1 (menos pressão no thr)
 ATR_MAX_THR_M1 = 0.00014          # Cap do threshold ATR adaptativo para M1 (teto dinâmico)
-ATR_MIN_RATIO_ABS_M1 = 0.000015
+ATR_MIN_RATIO_ABS_M1 = 0.000010   # ← AJUSTE: volatilidade mínima M1 (0.000010 = livre)
 ATR_MIN_RATIO_ABS_M5 = 0.000020
 ATR_RATIO_QUEUE_M1 = deque(maxlen=ATR_ADAPTIVE_WINDOW)
 ATR_RATIO_QUEUE_M5 = deque(maxlen=ATR_ADAPTIVE_WINDOW)
 
 ENABLE_TREND_STRENGTH_FILTER = True
 ADX_PERIOD = 14
-ADX_MIN_M1 = 10.5                 # Filtro ADX mais leve para M1
+ADX_MIN_M1 = 10.5                 # ← AJUSTE: ADX mínimo M1 (10.5 = aceita mercado fraco)
 ADX_MIN_M5 = 18.0
 BB_PERIOD = 20
 BB_STD = 2.0
-BB_WIDTH_MIN_M1 = 0.00022         # BB width mais permissivo para M1
+BB_WIDTH_MIN_M1 = 0.00018         # ← AJUSTE: BB width mínimo M1 (0.00018 = aceita compressão)
 BB_WIDTH_MIN_M5 = 0.00070
 SLOPE_LOOKBACK = 8
-SLOPE_MIN_M1 = 0.00005            # Slope mínimo mais leve para M1
+SLOPE_MIN_M1 = 0.00003            # ← AJUSTE: slope EMA mínimo M1 (0.00003 = aceita lateral)
 SLOPE_MIN_M5 = 0.00012
 
-ENTRY_WINDOW_SECONDS_M1 = 10      # Janela de entrada maior para M1 (menos missed_early_entry)
+ENTRY_WINDOW_SECONDS_M1 = 18      # ← AJUSTE: janela de entrada M1 (18s = menos missed_entry)
 ENTRY_WINDOW_SECONDS_M5 = 25
 
 OPEN_TIME_CACHE_TTL_S = 15
 _last_open_time_cache: Dict[Tuple[str, Optional[str]], Tuple[bool, float]] = {}
 
-RIGIDEZ_MODE = "normal"
-M1_PROFILE = "conservador"  # "conservador" (operacional) ou "extra_rigido" (laboratório)
+RIGIDEZ_MODE = "normal"  # Estratégia única: "normal" — parâmetros ajustáveis no bloco acima
 
 AMOUNT_MODE = "fixed"
 AMOUNT_FIXED = 1.0
@@ -511,6 +522,32 @@ def _is_open(open_times: Dict[str, Any], categoria: str, ativo: str) -> bool:
         return False
 
 
+def _asset_accepts_tf(info: Dict[str, Any], tf_min: int) -> bool:
+    """Verifica se um ativo aceita negociações no timeframe tf_min.
+
+    Args:
+        info: dict retornado por API.get_all_open_time()[categoria][ativo].
+        tf_min: timeframe em minutos (1=M1, 5=M5). 0 = sem filtro (aceita tudo).
+
+    Suporta campo 'timeframes' como dict {1: True, 5: True} ou list [1, 5, 15].
+    Fallback permissivo: se 'timeframes' ausente, assume aceito para não bloquear
+    ativos válidos quando a API omite esse campo.
+    ← PONTO-CHAVE: se um ativo aparecer indevidamente no pool com tf errado,
+       imprima API.get_all_open_time() para inspecionar o campo 'timeframes'.
+    """
+    if not isinstance(info, dict) or tf_min <= 0:
+        return True  # tf_min=0 desativa filtro; info inválida = aceito por segurança
+    tfs = info.get("timeframes")
+    if tfs is None:
+        # API não retornou dados de timeframe → assume aceito (fallback permissivo)
+        return True
+    if isinstance(tfs, dict):
+        return bool(tfs.get(tf_min) or tfs.get(str(tf_min)))
+    if isinstance(tfs, (list, tuple, set)):
+        return (tf_min in tfs) or (str(tf_min) in tfs)
+    return True  # formato desconhecido → aceito por segurança
+
+
 def _find_open_in_table(open_times: Dict[str, Any], ativo: str) -> Tuple[Optional[str], Optional[str]]:
     for cat in _categories_priority(tipo):
         if _is_open(open_times, cat, ativo):
@@ -801,10 +838,12 @@ def passes_trend_strength_filter(tf_min: int, velas: List[Dict[str, Any]]) -> bo
     slope = ema_slope_norm(closes, period=21, lookback=SLOPE_LOOKBACK)
 
     if tf_min == 1:
-        # M1: regra "3 de 4" — permite até 1 filtro abaixo do mínimo entre ATR, ADX, BBW, SLOPE
-        # Mantém segurança estrutural sem travar entradas por um indicador levemente abaixo
+        # M1: regra "2-de-4" — exige pelo menos 2 de 4 filtros passando (ATR, ADX, BBW, SLOPE)
+        # Estratégia livre: mais entradas sem abrir mão de todo critério de qualidade.
+        # ← AJUSTE: mude para "failures > 1" para voltar ao "3-de-4" (mais rígido/menos entradas)
+        #           mude para "failures > 3" para modo ultra-livre (pelo menos 1 de 4 basta)
         failures = 0
-        # Filtro ATR integrado (para regra 3-de-4, evita dois saltos de função)
+        # Filtro ATR integrado (para regra 2-de-4, evita dois saltos de função)
         if ENABLE_ATR_FILTER:
             atr = calculate_atr_from_candles(velas, periodo=ATR_PERIOD)
             mean_close = sum(closes[-ATR_PERIOD:]) / ATR_PERIOD if len(closes) >= ATR_PERIOD else (closes[-1] if closes else 0.0)
@@ -825,7 +864,7 @@ def passes_trend_strength_filter(tf_min: int, velas: List[Dict[str, Any]]) -> bo
         if slope is None or slope < slope_min:
             _log_blocked("ema_flat_slope", f"tf={tf_min} slope={slope}")
             failures += 1
-        if failures > 1:
+        if failures > 2:
             return False
         return True
 
@@ -848,12 +887,12 @@ def passes_trend_strength_filter(tf_min: int, velas: List[Dict[str, Any]]) -> bo
 def passes_all_regime_filters(tf_min: int, velas: List[Dict[str, Any]]) -> bool:
     """Verifica todos os filtros de regime de forma unificada.
 
-    M1: aplica regra "3 de 4" combinando ATR + ADX + BBW + SLOPE internamente
+    M1: aplica regra "2-de-4" combinando ATR + ADX + BBW + SLOPE internamente
         em passes_trend_strength_filter. Não chama passes_atr_filter separado.
     M5: mantém comportamento original — ATR e trend_strength são filtros rígidos.
     """
     if tf_min == 1:
-        # ATR já está integrado na regra 3-de-4 dentro de passes_trend_strength_filter
+        # ATR já está integrado na regra 2-de-4 dentro de passes_trend_strength_filter
         return passes_trend_strength_filter(tf_min, velas)
     # M5: todos os filtros são obrigatórios
     return passes_atr_filter(tf_min, velas) and passes_trend_strength_filter(tf_min, velas)
@@ -928,10 +967,11 @@ def is_harami_bullish(prev_c, cur_c) -> bool:
 # =========================
 
 # --- Parâmetros fixos do motor V15 (bloco centralizado, não dispersar) ---
-# Nota rigidez: M5 normal=80 | M5 rígida≈82 | M1 normal≈76 | M1 extra-rígida=90
-V15_SCORE_MIN = 76           # Score mínimo para sinal reversal V15 (0–100); ajustado por _apply_rigidez()
-V15_SCORE_GAP_MIN = 6        # Diferença mínima exigida entre call_score e put_score (evita empates técnicos)
-V15_CONFIRM_POLLS = 1        # Polls consecutivos de confirmação sustentada necessários (M1 ágil)
+# Estratégia: PRIORIDADE DIGITAL — perfil livre (mais entradas, qualidade mantida)
+# ← AJUSTE: aumente V15_SCORE_MIN para mais seletividade (ex.: 72, 76, 80)
+V15_SCORE_MIN = 68           # Score mínimo para sinal reversal V15 (0–100); 68 = mais entradas
+V15_SCORE_GAP_MIN = 3        # ← AJUSTE: diferença mínima call/put (3 = aceita empates técnicos leves)
+V15_CONFIRM_POLLS = 1        # Polls de confirmação necessários (1 = entrada imediata, mais timing)
 V15_RSI_PERIOD = 14          # Período RSI
 V15_RSI_OVERSOLD = 30        # RSI abaixo deste valor = oversold → sinal call
 V15_RSI_OVERBOUGHT = 70      # RSI acima deste valor = overbought → sinal put
@@ -1792,51 +1832,26 @@ def _buy_worker(direction, ativo, amount, expiration, result_container, event, a
 # Rigidez
 # =========================
 def _apply_rigidez():
-    """Ajusta os filtros conforme RIGIDEZ_MODE, TIMEFRAME_MINUTES e M1_PROFILE.
+    """Estratégia única: PRIORIDADE DIGITAL — parâmetros ajustáveis no topo do script.
 
-    Diferença de rigidez M1 vs M5:
-    ─────────────────────────────
-    M5 NORMAL      : parâmetros padrão (V15_SCORE_MIN=76, ADX_MIN_M5=18, etc.)
-    M5 RÍGIDA      : ADX +2, BB_WIDTH *1.20, SLOPE *1.25, janela menor
-    M1 CONSERVADOR : V15_SCORE_MIN=76, CONFIRM_POLLS=1, ADX=10.5, BB_WIDTH=0.00022,
-                     SLOPE=0.00005, janela 10s — modo operacional com mais entradas.
-    M1 EXTRA RÍGIDO: ADX +4, BB_WIDTH *1.35, SLOPE *1.50, janela 4s,
-                     V15_SCORE_MIN=90, CONFIRM_POLLS=4 — EXTRA RÍGIDA.
-                     Um único sinal por candle M1 (bloqueio por pending_lock_until).
+    RIGIDEZ_MODE = "normal" → usa os parâmetros definidos no bloco de ajuste fino acima.
+    RIGIDEZ_MODE = "rigida" → aplica multiplicadores M5 (uso avançado / backtesting).
+    Perfil M1 único: parâmetros "livres" definidos no bloco centralizados no topo.
+    Para experimentar variações, edite diretamente os valores no bloco
+    "ESTRATÉGIA: PRIORIDADE DIGITAL — AJUSTE FINO AQUI" no início deste arquivo.
     """
     global ADX_MIN_M1, ADX_MIN_M5, BB_WIDTH_MIN_M1, BB_WIDTH_MIN_M5, SLOPE_MIN_M1, SLOPE_MIN_M5
     global ENTRY_WINDOW_SECONDS_M1, ENTRY_WINDOW_SECONDS_M5
     global ATR_ADAPTIVE_FACTOR
-    global V15_SCORE_MIN, V15_CONFIRM_POLLS, V15_SCORE_GAP_MIN
     if RIGIDEZ_MODE != "rigida":
-        return
+        return  # Estratégia normal: parâmetros já definidos no bloco de ajuste fino
+    # Modo rígido M5 (opcional/avançado — raramente usado no fluxo principal)
     ADX_MIN_M5 += 2.0
     BB_WIDTH_MIN_M5 *= 1.20
     SLOPE_MIN_M5 *= 1.25
     ENTRY_WINDOW_SECONDS_M5 = min(ENTRY_WINDOW_SECONDS_M5, 18)
     ATR_ADAPTIVE_FACTOR = max(ATR_ADAPTIVE_FACTOR, 0.85)
-    if TIMEFRAME_MINUTES == 1:
-        if M1_PROFILE == "extra_rigido":
-            # M1 extra-rígida: filtros mais exigentes que M5 rígida
-            ADX_MIN_M1 += 4.0
-            BB_WIDTH_MIN_M1 *= 1.35
-            SLOPE_MIN_M1 *= 1.50
-            ENTRY_WINDOW_SECONDS_M1 = min(ENTRY_WINDOW_SECONDS_M1, 4)
-            ATR_ADAPTIVE_FACTOR = max(ATR_ADAPTIVE_FACTOR, 0.90)
-            V15_SCORE_MIN = 90       # Score mínimo mais alto para M1 extra rígido
-            V15_SCORE_GAP_MIN = 10   # Gap mais exigente no modo extra rígido
-            V15_CONFIRM_POLLS = 4    # Mais polls de confirmação para M1 extra rígido
-        else:
-            # M1 conservador: parâmetros operacionais para entrar mais com segurança
-            ADX_MIN_M1 = 10.5
-            BB_WIDTH_MIN_M1 = 0.00022
-            SLOPE_MIN_M1 = 0.00005
-            ENTRY_WINDOW_SECONDS_M1 = 10
-            ATR_ADAPTIVE_FACTOR = 0.45   # Restaura fator leve para M1 conservador (desfaz max 0.85 acima)
-            V15_SCORE_MIN = 76       # Score mais leve — mais entradas mantendo qualidade
-            V15_SCORE_GAP_MIN = 6    # Gap mínimo menor para M1 conservador
-            V15_CONFIRM_POLLS = 1    # Confirmação rápida para não perder timing no M1
-    else:
+    if TIMEFRAME_MINUTES != 1:
         ADX_MIN_M1 += 2.0
         BB_WIDTH_MIN_M1 *= 1.20
         SLOPE_MIN_M1 *= 1.25
@@ -1872,15 +1887,20 @@ def load_favorites() -> List[str]:
     return favs
 
 
-def build_asset_list(use_otc: bool, max_count: int) -> List[Tuple[str, str]]:
+def build_asset_list(use_otc: bool, max_count: int, tf_min: int = 0) -> List[Tuple[str, str]]:
     """Monta lista de (ativo, categoria) priorizando DIGITAL e depois binária.
 
-    1. Busca PRIMEIRO todos os ativos abertos na categoria 'digital', inclusive
-       índices sem sufixo (CXY, BXY, Dollar Index, etc.).
-    2. Adiciona ativos 'binary' abertos SOMENTE se não houver digital equivalente.
+    1. Busca PRIMEIRO todos os ativos abertos na categoria 'digital' que aceitam
+       o timeframe tf_min (M1 ou M5). Índices sem sufixo (CXY, BXY, etc.) inclusos.
+    2. Adiciona ativos 'binary' abertos que aceitam tf_min SOMENTE se não houver
+       digital equivalente (prioridade digital total).
     3. Nunca duplica: cada ativo aparece apenas uma vez (sempre preferindo digital).
     4. Prioriza favoritos.txt (com suporte a aliases para abreviações populares).
     5. Completa com outros ativos abertos do tipo até max_count.
+
+    Parâmetro tf_min: 1=M1, 5=M5, 0=sem filtro de timeframe.
+    ← PONTO-CHAVE: checagem de timeframe garante que apenas ativos com M1/M5
+       aberto entram no pool, evitando seleção de ativos só disponíveis em M15.
     """
     try:
         ot = API.get_all_open_time()
@@ -1894,11 +1914,14 @@ def build_asset_list(use_otc: bool, max_count: int) -> List[Tuple[str, str]]:
     open_assets: List[Tuple[str, str]] = []
     seen: set = set()
 
-    # 1ª passagem: DIGITAL tem prioridade total
+    # 1ª passagem: DIGITAL tem prioridade total — apenas com tf_min aceito
     digital_table = ot.get('digital', {})
     if isinstance(digital_table, dict):
         for name, info in digital_table.items():
             if not (isinstance(info, dict) and info.get('open')):
+                continue
+            # ← Checagem de timeframe: descarta digital sem M1/M5 disponível
+            if tf_min > 0 and not _asset_accepts_tf(info, tf_min):
                 continue
             name_u = str(name).upper()
             if name_u in seen:
@@ -1914,11 +1937,14 @@ def build_asset_list(use_otc: bool, max_count: int) -> List[Tuple[str, str]]:
                     open_assets.append((name, 'digital'))
                     seen.add(name_u)
 
-    # 2ª passagem: binária apenas para ativos SEM equivalente digital aberto
+    # 2ª passagem: binária apenas para ativos SEM equivalente digital — apenas com tf_min aceito
     binary_table = ot.get('binary', {})
     if isinstance(binary_table, dict):
         for name, info in binary_table.items():
             if not (isinstance(info, dict) and info.get('open')):
+                continue
+            # ← Checagem de timeframe: descarta binária sem M1/M5 disponível
+            if tf_min > 0 and not _asset_accepts_tf(info, tf_min):
                 continue
             name_u = str(name).upper()
             if name_u in seen:
@@ -1965,13 +1991,15 @@ def build_asset_list(use_otc: bool, max_count: int) -> List[Tuple[str, str]]:
     return result
 
 
-def build_candidate_pool(use_otc: bool, limit: int = 200) -> List[Tuple[str, str]]:
+def build_candidate_pool(use_otc: bool, limit: int = 200, tf_min: int = 0) -> List[Tuple[str, str]]:
     """Retorna todos os candidatos disponíveis (favoritos primeiro, depois resto do book).
 
     Igual a build_asset_list mas com limite generoso para varredura dinâmica.
+    Filtra por tf_min quando fornecido — garante que apenas ativos com o
+    timeframe correto (M1/M5) entrem no pool de candidatos.
     Não aplica o limite do usuário — o chamador filtra o que já está ativo.
     """
-    return build_asset_list(use_otc=use_otc, max_count=limit)
+    return build_asset_list(use_otc=use_otc, max_count=limit, tf_min=tf_min)
 
 
 def rank_assets_by_regime(
@@ -2088,24 +2116,6 @@ def ask_timeframe():
             return 1
         if r == "2":
             return 5
-
-
-def ask_m1_profile():
-    """Pergunta ao usuário qual perfil do M1 deseja usar."""
-    print("\n" + "=" * 70)
-    print("⚙️  PERFIL M1")
-    print("=" * 70)
-    print("  1) M1 Conservador  ✅  (operacional — mais entradas, filtros turbo)")
-    print("     Score=76, Polls=1, ADX=10.5, BB=0.00022, Slope=0.00005, Janela=10s")
-    print("     Filtro 3-de-4, cap ATR=0.00014, ranking top 4 ativos dinâmico")
-    print("  2) M1 Extra Rígido 🔬  (laboratório/apresentação — muito seletivo)")
-    print("     Score=90, Polls=4, ADX+4, BB×1.35, Slope×1.50, Janela=4s")
-    while True:
-        r = input("\n👉 Digite 1 ou 2 [1]: ").strip() or "1"
-        if r == "1":
-            return "conservador"
-        if r == "2":
-            return "extra_rigido"
 
 
 def ask_entry_mode():
@@ -2768,7 +2778,8 @@ def loop_patterns_multi(
         last_recheck_cid = now_cid
 
         try:
-            candidates = build_candidate_pool(use_otc=use_otc)
+            # ← Filtra candidatos por timeframe (M1/M5) e prioridade digital
+            candidates = build_candidate_pool(use_otc=use_otc, tf_min=tf_min)
         except Exception as exc:
             _log_error("Falha ao buscar pool de candidatos em _refill_pool.", exc)
             return
@@ -2839,7 +2850,8 @@ def loop_patterns_multi(
         )
         active_names = {a.upper() for a, _ in active_ativos}
         try:
-            candidates = build_candidate_pool(use_otc=use_otc)
+            # ← Filtra candidatos por timeframe (M1/M5) e prioridade digital
+            candidates = build_candidate_pool(use_otc=use_otc, tf_min=tf_min)
         except Exception as exc:
             _log_error("Falha ao buscar pool de candidatos em _replace_asset.", exc)
             return
@@ -3194,26 +3206,16 @@ if __name__ == '__main__':
     # Modo fixo: REVERSÃO
     ENTRY_MODE = "reversal"
 
-    # Rigidez: M1 → pede perfil ao usuário; M5 → normal
-    if TIMEFRAME_MINUTES == 1:
-        M1_PROFILE = ask_m1_profile()
-        RIGIDEZ_MODE = "rigida"
-        if M1_PROFILE == "conservador":
-            print(f"\n✅ Perfil M1 Conservador selecionado (operacional).")
-            print("   (Score=84, Polls=2, ADX=18, BB=0.00050, Slope=0.00009, Janela=5s)")
-        else:
-            print(f"\n⚠️  Perfil M1 Extra Rígido selecionado (laboratório/apresentação).")
-            print("   (Score=90, Polls=4, ADX+4, BB×1.35, Slope×1.50, Janela=4s)")
-    else:
-        RIGIDEZ_MODE = "normal"
+    # Estratégia única: PRIORIDADE DIGITAL — parâmetros ajustáveis no topo do script
+    RIGIDEZ_MODE = "normal"
     _apply_rigidez()
 
-    # Montar lista de ativos inicial (pode estar vazia se mercado ainda fechado)
-    print(f"\n🔍 Buscando ativos {market_label} disponíveis...")
-    ativos_lista = build_asset_list(use_otc=use_otc, max_count=max_ativos)
+    # Montar lista de ativos inicial priorizando digital com tf aberto
+    print(f"\n🔍 Buscando ativos DIGITAL {market_label} com M{TIMEFRAME_MINUTES} disponível...")
+    ativos_lista = build_asset_list(use_otc=use_otc, max_count=max_ativos, tf_min=TIMEFRAME_MINUTES)
     if not ativos_lista:
         print(
-            f"⚠️  Nenhum ativo {market_label} disponível em M{TIMEFRAME_MINUTES} agora. "
+            f"⚠️  Nenhum ativo DIGITAL {market_label} com M{TIMEFRAME_MINUTES} aberto agora. "
             "O bot vai aguardar e tentar a cada ciclo conforme os mercados abrirem."
         )
 
@@ -3232,11 +3234,8 @@ if __name__ == '__main__':
         print(f'👤 Usuário: {nome}')
     print(f'InstanceTag: {INSTANCE_TAG}')
     print(f'Conta: {"DEMO" if conta == "PRACTICE" else "REAL"} | Mercado: {market_label}')
-    print(f'Timeframe: M{TIMEFRAME_MINUTES} | Modo: REVERSÃO | Rigidez: {RIGIDEZ_MODE.upper()}')
-    if TIMEFRAME_MINUTES == 1:
-        perfil_label = "Conservador" if M1_PROFILE == "conservador" else "Extra Rígido"
-        print(f'Perfil M1: {perfil_label}')
-    print(f'Prioridade: DIGITAL → BINÁRIA (fallback) | PREFER_DIGITAL={PREFER_DIGITAL}')
+    print(f'Timeframe: M{TIMEFRAME_MINUTES} | Modo: REVERSÃO | Estratégia: Prioridade Digital (livre)')
+    print(f'Prioridade: DIGITAL com M{TIMEFRAME_MINUTES} → BINÁRIA (fallback apenas se faltar digital)')
     print(f'Ativos: {len(ativos_lista)}/{max_ativos}')
     print('Ativos selecionados:')
     for a, ak in ativos_lista:
@@ -3249,7 +3248,9 @@ if __name__ == '__main__':
     timer_label = f"{run_minutes} min" if run_minutes > 0 else "ilimitado"
     entries_label = str(MAX_ENTRIES) if MAX_ENTRIES > 0 else "ilimitado"
     print(f'Temporizador: {timer_label} | Entradas máx: {entries_label}')
-    print(f'V15_SCORE_MIN={V15_SCORE_MIN} | ADX_M1={ADX_MIN_M1:.1f} | ADX_M5={ADX_MIN_M5:.1f}')
+    print(f'V15_SCORE_MIN={V15_SCORE_MIN} | V15_SCORE_GAP_MIN={V15_SCORE_GAP_MIN} | V15_CONFIRM_POLLS={V15_CONFIRM_POLLS}')
+    print(f'ADX_M1={ADX_MIN_M1:.1f} | BB_M1={BB_WIDTH_MIN_M1:.5f} | SLOPE_M1={SLOPE_MIN_M1:.5f}')
+    print(f'ENTRY_WINDOW_M1={ENTRY_WINDOW_SECONDS_M1}s | ATR_MIN_M1={ATR_MIN_RATIO_ABS_M1:.6f}')
     print(f'Logs: {LOG_DIR.as_posix()}/ | State: {STATE_DIR.as_posix()}/')
     print('=' * 70)
     print('\n🚀 Iniciando...\n')
