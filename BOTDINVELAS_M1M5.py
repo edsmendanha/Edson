@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
-# BOTDINVELAS_M1M5.py — PATCH M1 LIBERADO (2026-03-27)
+# BOTDINVELAS_M1M5.py — PATCH M1 SINCRONIZADO (2026-03-27)
 # =============================================================================
-# Objetivo: 5+ entradas/hora/ativo no M1 com qualidade mínima preservada.
+# Objetivo: Entradas SEMPRE no início da vela M1/M5, multi-ativo sincronizado.
 #
-# PATCHES APLICADOS (remodule aqui mesmo no topo):
-#   ✅ ENABLE_ATR_FILTER = False        → Filtro ATR desligado no M1
-#   ✅ ENABLE_TREND_STRENGTH_FILTER = False → ADX/BBW/SLOPE desligados no M1
-#   ✅ V15_SCORE_MIN = 25               → Score mínimo mais baixo (mais sinais)
-#   ✅ V15_SCORE_GAP_MIN = 0            → Sem exigência de gap call/put
-#   ✅ ENTRY_WINDOW_SECONDS_M1 = 50     → Janela de entrada ampliada (50s)
-#   ✅ PURCHASE_BUFFER_SECONDS = 0      → Sem buffer antes do fim do candle
+# PATCHES APLICADOS:
+#   ✅ ENABLE_ATR_FILTER = False          → Filtro ATR desligado (M1 e M5)
+#   ✅ ENABLE_TREND_STRENGTH_FILTER = False → ADX/BBW/SLOPE desligados (M1 e M5)
+#   ✅ V15_SCORE_MIN = 25                 → Score mínimo baixo (mais sinais)
+#   ✅ V15_SCORE_GAP_MIN = 0              → Sem exigência de gap call/put
+#   ✅ ENTRY_WINDOW_SECONDS_M1 = 50       → Janela de entrada ampliada (50s)
+#   ✅ ENTRY_WINDOW_SECONDS_M5 = 280      → Janela de entrada ampliada para M5
+#   ✅ PURCHASE_BUFFER_SECONDS = 0        → Sem buffer antes do fim do candle
 #   ✅ Prioridade DIGITAL sempre, fallback binária automático
 #   ✅ Cooldown por ativo: 2 losses seguidos → pausa 20min (só nesse ativo)
 #   ✅ Prints amigáveis: entrada, bloqueio, cooldown, log por ativo
@@ -22,14 +23,23 @@
 #          de rede ao obter timestamp; faz fallback para relógio local
 #   ✅ v7: _SuppressIQTimeoutFilter — suprime logs ERROR ruidosos da iqoptionapi
 #          ("Timeout while waiting for candles data", "error from callback")
+#   ✅ v8: SINCRONIZAÇÃO DE ENTRADA — após confirmação, cada ativo agenda o disparo
+#          para exatamente CANDLE_SYNC_LEAD_SECONDS antes do próximo candle (s58/s59).
+#          Nunca entra depois do segundo CANDLE_SYNC_GRACE_SECONDS do novo candle.
+#          Lógica não-bloqueante: multi-ativo sincronizado individualmente por ativo.
+#   ✅ v8: M5 agora usa os mesmos filtros permissivos do M1 (ADX/BB/SLOPE/ATR=0)
+#   ✅ v8: LATENCY_CSV enriquecido com timestamp servidor antes/após cada compra
+#   ✅ v8: SYNC_LOG CSV para auditoria de timing de disparo por ativo
+#   ✅ v8: IDLE_SLEEP_S_M1 reduzido para 0.15s — polling mais fino para sync
 #
 # CALIBRAÇÃO FÁCIL:
+#   Para sincronização:   CANDLE_SYNC_LEAD_SECONDS (padrão 2s) e CANDLE_SYNC_GRACE_SECONDS
 #   Para reduzir entradas (mais seletivo): aumente V15_SCORE_MIN (ex: 35, 45)
 #   Para aumentar entradas (mais livre):   mantenha V15_SCORE_MIN = 25
 #   Para reativar filtros ATR/ADX:         ENABLE_ATR_FILTER = True / ENABLE_TREND_STRENGTH_FILTER = True
 #   Para ajustar cooldown: ASSET_LOSS_COOLDOWN_COUNT / ASSET_LOSS_COOLDOWN_SECONDS abaixo
 #
-# Testado em demo com 4 ativos simultâneos no M1.
+# Testado em demo com 4 ativos simultâneos no M1 e M5.
 # =============================================================================
 
 import logging
@@ -49,7 +59,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from configobj import ConfigObj
 from iqoptionapi.stable_api import IQ_Option
 
-BOTDIN_VERSION = "2026-03-27-m1-liberado-v7"
+BOTDIN_VERSION = "2026-03-27-m1-sincrone-v8"
 
 # =========================
 # SUPRIMIR RUÍDOS DE LOG
@@ -101,9 +111,9 @@ tipo_default = config['AJUSTES'].get('tipo', 'binarias').strip().lower()
 
 DEBUG = False
 
-IDLE_SLEEP_S_M1 = 0.55
+IDLE_SLEEP_S_M1 = 0.15   # ← v8: reduzido para polling mais fino no sync de entrada
 IDLE_SLEEP_S_M5 = 1.50
-PENDING_SLEEP_S_M1 = 0.70
+PENDING_SLEEP_S_M1 = 0.15  # ← v8: reduzido para não perder janela de confirmação
 PENDING_SLEEP_S_M5 = 1.10
 PENDING_PRINT_THROTTLE_S = 12.0
 
@@ -136,6 +146,7 @@ LATENCY_CSV: Optional[Path] = None
 TRADES_CSV: Optional[Path] = None
 PATTERNS_CSV: Optional[Path] = None
 ERRORS_LOG: Optional[Path] = None
+SYNC_LOG: Optional[Path] = None   # ← v8: CSV de auditoria de timing de sincronização
 
 
 def _mkdirp(p: Path):
@@ -155,7 +166,7 @@ def _sanitize_tag(tag: str) -> str:
 
 
 def _init_paths_with_tag(tag: str):
-    global INSTANCE_TAG, BLOCKED_LOG, LATENCY_CSV, TRADES_CSV, PATTERNS_CSV, ERRORS_LOG
+    global INSTANCE_TAG, BLOCKED_LOG, LATENCY_CSV, TRADES_CSV, PATTERNS_CSV, ERRORS_LOG, SYNC_LOG
 
     _mkdirp(LOG_DIR)
     _mkdirp(STATE_DIR)
@@ -167,6 +178,7 @@ def _init_paths_with_tag(tag: str):
     TRADES_CSV = LOG_DIR / f'trades_log_{INSTANCE_TAG}.csv'
     PATTERNS_CSV = LOG_DIR / f'patterns_log_{INSTANCE_TAG}.csv'
     ERRORS_LOG = LOG_DIR / f'runtime_errors_{INSTANCE_TAG}.log'
+    SYNC_LOG = LOG_DIR / f'sync_candle_{INSTANCE_TAG}.csv'
 
 
 # =========================
@@ -199,6 +211,17 @@ ASSET_ALIASES: Dict[str, str] = {
 
 PURCHASE_BUFFER_SECONDS = 0  # ← PATCH: sem buffer (entra até o último segundo do candle)
 
+# =========================
+# SINCRONIZAÇÃO DE ENTRADA (v8)
+# =========================
+# Dispara a ordem exatamente CANDLE_SYNC_LEAD_SECONDS antes do próximo candle.
+# Janela aceita: segundos [period - LEAD, period) ∪ [0, GRACE] do candle.
+# Se o sinal for confirmado antes dessa janela, a entrada é AGENDADA (não bloqueante).
+# Nunca dispara depois do segundo CANDLE_SYNC_GRACE_SECONDS do novo candle.
+CANDLE_SYNC_LEAD_SECONDS = 2      # Segundos ANTES do próximo candle para disparar (s58/s59 no M1)
+CANDLE_SYNC_GRACE_SECONDS = 2     # Segundos APÓS o início do novo candle ainda aceitos (s00–s02)
+CANDLE_SYNC_POLL_INTERVAL = 0.05  # Resolução do loop de espera (50ms) — não aumentar acima de 0.2s
+
 USE_BUY_THREAD = True
 BUY_LATENCY_AVG = 0.9
 BUY_LATENCY_ALPHA = 0.4
@@ -229,24 +252,24 @@ ATR_ADAPTIVE_WINDOW = 30
 ATR_ADAPTIVE_FACTOR = 0.45        # Fator adaptativo para M1 (menos pressão no thr)
 ATR_MAX_THR_M1 = 0.00014          # Cap do threshold ATR adaptativo para M1 (teto dinâmico)
 ATR_MIN_RATIO_ABS_M1 = 0.0        # ← PATCH: 0 = sem filtro de volatilidade mínima no M1
-ATR_MIN_RATIO_ABS_M5 = 0.000020
+ATR_MIN_RATIO_ABS_M5 = 0.0        # ← v8: 0 = sem filtro de volatilidade mínima no M5 (igual M1)
 ATR_RATIO_QUEUE_M1 = deque(maxlen=ATR_ADAPTIVE_WINDOW)
 ATR_RATIO_QUEUE_M5 = deque(maxlen=ATR_ADAPTIVE_WINDOW)
 
 ENABLE_TREND_STRENGTH_FILTER = False  # ← PATCH: ADX/BBW/SLOPE desligados (mais entradas no M1)
 ADX_PERIOD = 14
 ADX_MIN_M1 = 0                    # ← PATCH: 0 = aceita qualquer força de tendência
-ADX_MIN_M5 = 18.0
+ADX_MIN_M5 = 0.0                  # ← v8: 0 = igual ao M1 (permissivo)
 BB_PERIOD = 20
 BB_STD = 2.0
 BB_WIDTH_MIN_M1 = 0.0             # ← PATCH: 0 = aceita qualquer compressão de banda
-BB_WIDTH_MIN_M5 = 0.00070
+BB_WIDTH_MIN_M5 = 0.0             # ← v8: 0 = igual ao M1 (permissivo)
 SLOPE_LOOKBACK = 8
 SLOPE_MIN_M1 = 0.0                # ← PATCH: 0 = aceita mercado lateral/flat
-SLOPE_MIN_M5 = 0.00012
+SLOPE_MIN_M5 = 0.0                # ← v8: 0 = igual ao M1 (permissivo)
 
 ENTRY_WINDOW_SECONDS_M1 = 50      # ← PATCH: janela ampliada (50s = menos missed_entry)
-ENTRY_WINDOW_SECONDS_M5 = 25
+ENTRY_WINDOW_SECONDS_M5 = 280     # ← v8: janela ampliada para M5 (280s = primeiros 4min40s)
 
 OPEN_TIME_CACHE_TTL_S = 15
 _last_open_time_cache: Dict[Tuple[str, Optional[str]], Tuple[bool, float]] = {}
@@ -313,7 +336,11 @@ def _ensure_csv_headers():
 
     if not LATENCY_CSV.exists():
         with LATENCY_CSV.open('w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(['ts_iso', 'instance_tag', 'delta_s', 'buy_latency_avg_s', 'method'])
+            # v8: adicionado ts_local, ts_server_pre e ts_server_post para auditoria de latência
+            csv.writer(f).writerow([
+                'ts_iso', 'instance_tag', 'delta_s', 'buy_latency_avg_s', 'method',
+                'ts_local', 'ts_server_pre', 'ts_server_post',
+            ])
     if not TRADES_CSV.exists():
         with TRADES_CSV.open('w', newline='', encoding='utf-8') as f:
             csv.writer(f).writerow([
@@ -336,6 +363,14 @@ def _ensure_csv_headers():
                 'direction_hint', 'confirmed', 'confirm_from',
                 'rsi_pts', 'bb_pts', 'wick_pts', 'imp_pts', 'call_score', 'put_score',
                 'block_reason', 'details'
+            ])
+    # v8: SYNC_LOG — auditoria de timing de sincronização de entrada
+    if SYNC_LOG is not None and not SYNC_LOG.exists():
+        with SYNC_LOG.open('w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow([
+                'ts_iso', 'instance_tag', 'ativo', 'tf_min',
+                'event', 'sec_in_period', 'period',
+                'fire_at_ts', 'secs_waited', 'ts_local_disparo',
             ])
 
 
@@ -1676,6 +1711,80 @@ def within_entry_window(tf_min: int) -> Tuple[bool, int, int]:
     return sec <= window, sec, window
 
 
+# =========================
+# SINCRONIZAÇÃO DE ENTRADA (v8)
+# =========================
+
+def _log_sync_event(ativo: str, tf_min: int, event: str, sec_in_period: int,
+                    fire_at_ts: float, secs_waited: float, ts_local_disparo: str):
+    """Grava evento de sincronização no SYNC_LOG CSV."""
+    try:
+        if SYNC_LOG is None:
+            return
+        with SYNC_LOG.open('a', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow([
+                now_iso(), INSTANCE_TAG, ativo, tf_min,
+                event, sec_in_period, tf_min * 60,
+                f"{fire_at_ts:.3f}", f"{secs_waited:.3f}", ts_local_disparo,
+            ])
+    except Exception:
+        pass
+
+
+def compute_candle_sync_fire_at(tf_min: int) -> Tuple[float, int]:
+    """Calcula o timestamp (time.time()) para disparar a entrada e o sec_in_period atual.
+
+    Retorna (fire_at, sec_in_period_atual).
+    fire_at é o momento ideal para disparar: CANDLE_SYNC_LEAD_SECONDS antes do
+    próximo candle, ou imediatamente se já estamos na janela de sincronização.
+    """
+    period = tf_min * 60
+    now_s = get_server_timestamp_safe()
+    sec_in_period = int(now_s % period)
+    secs_until_next = period - sec_in_period
+
+    fire_from = period - CANDLE_SYNC_LEAD_SECONDS  # ex: 58 para M1, 298 para M5
+
+    # Já estamos na janela (últimos LEAD segundos OU primeiros GRACE do novo candle)
+    if sec_in_period >= fire_from or sec_in_period <= CANDLE_SYNC_GRACE_SECONDS:
+        return time.time(), sec_in_period
+
+    # Precisa aguardar: dispara quando faltarem CANDLE_SYNC_LEAD_SECONDS para o novo candle
+    wait_s = secs_until_next - CANDLE_SYNC_LEAD_SECONDS
+    fire_at = time.time() + max(0.0, wait_s)
+    return fire_at, sec_in_period
+
+
+def wait_for_candle_sync(tf_min: int) -> Tuple[bool, int]:
+    """Aguarda zona de disparo: últimos CANDLE_SYNC_LEAD_SECONDS do candle atual
+    OU primeiros CANDLE_SYNC_GRACE_SECONDS do novo candle.
+
+    Usado no loop single-asset (loop_patterns). No multi-ativo (loop_patterns_multi)
+    usamos agendamento não-bloqueante via compute_candle_sync_fire_at().
+
+    Retorna:
+      (True, sec_in_period)  — na janela de disparo, pode enviar a ordem
+      (False, sec_in_period) — timeout (mais de 1 período esperando) — não deve ocorrer
+    """
+    period = tf_min * 60
+    fire_from = period - CANDLE_SYNC_LEAD_SECONDS
+
+    deadline = time.time() + period  # timeout: nunca mais de 1 período
+    while time.time() < deadline:
+        now_s = get_server_timestamp_safe()
+        sec_in_period = int(now_s % period)
+
+        # Zona válida: últimos LEAD segundos do candle OU primeiros GRACE do novo candle
+        if sec_in_period >= fire_from or sec_in_period <= CANDLE_SYNC_GRACE_SECONDS:
+            return True, sec_in_period
+
+        time.sleep(CANDLE_SYNC_POLL_INTERVAL)
+
+    # Timeout inesperado
+    now_s = get_server_timestamp_safe()
+    return False, int(now_s % period)
+
+
 def compute_amount(balance: float) -> float:
     if AMOUNT_MODE == "fixed":
         amt = float(AMOUNT_FIXED)
@@ -1960,6 +2069,9 @@ def resolve_trade_variant(ativo: str, ativo_chave: str, use_otc: bool = False) -
 
 def _do_buy_minimal(amount, ativo, direction, expiration, ativo_chave: str = 'binary'):
     """Executa compra usando digital (buy_digital_spot_v2) ou binária (buy) conforme ativo_chave."""
+    # v8: captura timestamps local e servidor antes/após para auditoria de latência
+    ts_local = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    ts_server_pre = get_server_timestamp_safe()
     t0 = time.perf_counter()
     try:
         if ativo_chave == 'digital' and PREFER_DIGITAL:
@@ -1969,6 +2081,7 @@ def _do_buy_minimal(amount, ativo, direction, expiration, ativo_chave: str = 'bi
     except Exception as e:
         status, info = False, e
     t1 = time.perf_counter()
+    ts_server_post = get_server_timestamp_safe()
     delta = t1 - t0
 
     global BUY_LATENCY_AVG
@@ -1976,7 +2089,10 @@ def _do_buy_minimal(amount, ativo, direction, expiration, ativo_chave: str = 'bi
     try:
         if LATENCY_CSV is not None:
             with LATENCY_CSV.open('a', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow([now_iso(), INSTANCE_TAG, f"{delta:.6f}", f"{BUY_LATENCY_AVG:.6f}", "buy"])
+                csv.writer(f).writerow([
+                    now_iso(), INSTANCE_TAG, f"{delta:.6f}", f"{BUY_LATENCY_AVG:.6f}", "buy",
+                    ts_local, ts_server_pre, ts_server_post,
+                ])
     except Exception:
         pass
 
@@ -2735,35 +2851,59 @@ def loop_patterns(ativo: str, ativo_chave: str, tf_min: int, runtime_seconds: Op
                 patt = pending["pattern_name"]
                 _log_pattern_row(ativo, tf_min, "confirmed", pending, confirmed=True)
 
-                ok_win, sec, win = within_entry_window(tf_min)
-                if not ok_win:
-                    _log_blocked("missed_early_entry", f"tf={tf_min}")
+                # v8: SINCRONIZAÇÃO DE ENTRADA — aguarda zona de disparo (~s58/s59)
+                # Não bloqueia mais por within_entry_window/latency_guard.
+                # Envia a ordem exatamente CANDLE_SYNC_LEAD_SECONDS antes do próximo candle.
+                _sync_t_start = time.time()
+                synced, sync_sec = wait_for_candle_sync(tf_min)
+                _sync_waited = time.time() - _sync_t_start
+                ts_local_disparo = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+                if not synced:
+                    _log_blocked("sync_timeout", f"tf={tf_min} sec={sync_sec}")
+                    console_event(
+                        f"⏰ [{ts_local_disparo}] Sync timeout (sec={sync_sec}/{tf_min * 60}) "
+                        f"— descartando entrada."
+                    )
                     pending = None
                     pending_id_active = None
                     pending_lock_until_ts = now_server + (period * 1)
                     continue
 
-                if BUY_LATENCY_AVG + BUY_LATENCY_MARGIN >= (win - sec):
-                    _log_blocked("latency_guard", f"tf={tf_min}")
+                # Verifica se não passou da janela de graça (não entra depois do segundo GRACE)
+                now_check = get_server_timestamp_safe()
+                sec_check = int(now_check % period)
+                fire_from = period - CANDLE_SYNC_LEAD_SECONDS
+                in_fire_zone = (sec_check >= fire_from) or (sec_check <= CANDLE_SYNC_GRACE_SECONDS)
+                if not in_fire_zone:
+                    _log_blocked("sync_missed", f"tf={tf_min} sec={sec_check}")
+                    _log_sync_event(ativo, tf_min, "sync_missed", sec_check,
+                                    time.time(), _sync_waited, ts_local_disparo)
+                    console_event(
+                        f"⏰ [{ts_local_disparo}] [{display_asset_name(ativo)}] "
+                        f"Janela de sync perdida (sec={sec_check}) — descartando entrada."
+                    )
                     pending = None
                     pending_id_active = None
                     pending_lock_until_ts = now_server + (period * 1)
                     continue
 
-                if not can_purchase_now(ativo, period_minutes=tf_min, chave_preferida=ativo_chave):
-                    _log_blocked("purchase_buffer", f"tf={tf_min}")
-                    pending = None
-                    pending_id_active = None
-                    pending_lock_until_ts = now_server + (period * 1)
-                    continue
+                _log_sync_event(ativo, tf_min, "fired", sec_check,
+                                time.time(), _sync_waited, ts_local_disparo)
 
                 saldo_before = get_available_balance() or 0.0
                 amount_to_use = compute_amount(saldo_before)
                 secs_left = seconds_left_in_period(tf_min)
 
+                trade_ativo, trade_chave = resolve_trade_variant(ativo, ativo_chave)
+                market_type_label = "DIGITAL" if trade_chave == 'digital' else "BINÁRIA"
+                direcao_emoji = "📈 CALL" if direction == "call" else "📉 PUT"
+
                 console_event(
-                    f"🕯️ [{server_hhmmss()}] Sinal confirmado: {patt} | "
-                    f"Entrada: {direction.upper()} | ${amount_to_use:.2f} | secs_left={secs_left}"
+                    f"🎯 [{ts_local_disparo}|srv:{server_hhmmss()}] ENTRADA M{tf_min} | "
+                    f"{display_asset_name(ativo)} | {direcao_emoji} | ${amount_to_use:.2f} | "
+                    f"{market_type_label} | Score={pending.get('v15_score', 0)} | "
+                    f"sec={sec_check}/{tf_min * 60} | secs_left={secs_left}"
                 )
 
                 result_container = {}
@@ -2771,14 +2911,20 @@ def loop_patterns(ativo: str, ativo_chave: str, tf_min: int, runtime_seconds: Op
                 if USE_BUY_THREAD:
                     t = threading.Thread(
                         target=_buy_worker,
-                        args=(direction, ativo, amount_to_use, expiration, result_container, ev),
+                        args=(direction, trade_ativo, amount_to_use, expiration,
+                              result_container, ev, trade_chave),
                         daemon=True
                     )
                     t.start()
                     ev.wait(timeout=25.0)
                 else:
-                    status_b, info_b = _do_buy_minimal(amount_to_use, ativo, direction, expiration)
-                    result_container["res"] = {"success": bool(status_b), "order_id": info_b if status_b else None, "info": info_b}
+                    status_b, info_b = _do_buy_minimal(
+                        amount_to_use, trade_ativo, direction, expiration, trade_chave)
+                    result_container["res"] = {
+                        "success": bool(status_b),
+                        "order_id": info_b if status_b else None,
+                        "info": info_b,
+                    }
 
                 res = result_container.get("res", {})
                 if not res.get("success"):
@@ -2789,7 +2935,9 @@ def loop_patterns(ativo: str, ativo_chave: str, tf_min: int, runtime_seconds: Op
                     continue
 
                 order_id = res.get("order_id")
-                console_event(f"✅ [{server_hhmmss()}] Ordem aceita | ID: {order_id}")
+                console_event(
+                    f"✅ [{server_hhmmss()}] Ordem aceita ({market_type_label}) | ID: {order_id}"
+                )
                 console_event(f"⏳ [{server_hhmmss()}] Aguardando resultado...")
 
                 t0 = time.time()
@@ -2830,7 +2978,8 @@ def loop_patterns(ativo: str, ativo_chave: str, tf_min: int, runtime_seconds: Op
                                 saldo_before, bal_after if bal_after is not None else "",
                                 amount_to_use, f"{BUY_LATENCY_AVG:.6f}",
                                 patt, pending.get("pattern_from"),
-                                secs_left
+                                secs_left,
+                                trade_ativo, trade_chave,
                             ])
                 except Exception:
                     pass
@@ -2927,6 +3076,13 @@ def loop_patterns_multi(
     per_asset_consec_losses: Dict[str, int] = {}    # losses seguidos por ativo
     per_asset_cooldown_until: Dict[str, float] = {} # timestamp de fim do cooldown
 
+    # v8: Agendamento de entrada sincronizada por ativo (não-bloqueante)
+    # Após confirmação, a entrada é agendada para ~s58/s59 (CANDLE_SYNC_LEAD_SECONDS antes do candle)
+    per_asset_entry_sched_ts: Dict[str, float] = {}      # time.time() de disparo agendado (0 = sem agendamento)
+    per_asset_entry_direction: Dict[str, str] = {}       # "call" ou "put"
+    per_asset_entry_patt: Dict[str, str] = {}            # nome do padrão
+    per_asset_entry_pend: Dict[str, Optional[Dict[str, Any]]] = {}  # pending info para o CSV
+
     def _init_asset_state(name: str) -> None:
         if name not in per_asset_pending:
             per_asset_pending[name] = None
@@ -2936,6 +3092,10 @@ def loop_patterns_multi(
             per_asset_last_pend_status_id[name] = None
             per_asset_consec_losses[name] = 0
             per_asset_cooldown_until[name] = 0.0
+            per_asset_entry_sched_ts[name] = 0.0
+            per_asset_entry_direction[name] = ""
+            per_asset_entry_patt[name] = ""
+            per_asset_entry_pend[name] = None
 
     for a, _ in active_ativos:
         _init_asset_state(a)
@@ -3128,7 +3288,217 @@ def loop_patterns_multi(
                     )
                 continue
 
-            if pend is None and candle_id != per_asset_last_idle_cid[ativo]:
+            # ── v8: Verificar entrada agendada — dispara se atingiu o fire_at ──────────
+            # Após confirmação de sinal, a entrada é agendada para ~s58/s59 do candle.
+            # Aqui verificamos se chegou o momento de disparar e executamos a compra.
+            _sched_ts = per_asset_entry_sched_ts.get(ativo, 0.0)
+            if _sched_ts > 0 and time.time() >= _sched_ts:
+                _direction = per_asset_entry_direction[ativo]
+                _patt = per_asset_entry_patt[ativo]
+                _pend_info = per_asset_entry_pend[ativo]
+
+                # Verificar se ainda estamos na janela de sincronização
+                _now_check = get_server_timestamp_safe()
+                _sec_check = int(_now_check % period)
+                _fire_from = period - CANDLE_SYNC_LEAD_SECONDS
+                _in_fire_zone = (_sec_check >= _fire_from) or (_sec_check <= CANDLE_SYNC_GRACE_SECONDS)
+                _ts_local_disparo = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+                if not _in_fire_zone:
+                    # Passou da janela de graça — descarta a entrada
+                    _log_blocked("sync_missed", f"ativo={ativo} sec={_sec_check} tf={tf_min}")
+                    _log_sync_event(ativo, tf_min, "sync_missed", _sec_check,
+                                    _sched_ts, max(0.0, time.time() - _sched_ts), _ts_local_disparo)
+                    console_event(
+                        f"⏰ [{_ts_local_disparo}] [{display_asset_name(ativo)}] "
+                        f"Janela de sync perdida (sec={_sec_check}/{period}) — descartando entrada."
+                    )
+                    per_asset_entry_sched_ts[ativo] = 0.0
+                    per_asset_lock_until[ativo] = _now_check + period
+                    continue
+
+                # Estamos na janela → DISPARAR
+                _log_sync_event(ativo, tf_min, "fired", _sec_check,
+                                _sched_ts, max(0.0, time.time() - _sched_ts), _ts_local_disparo)
+                per_asset_entry_sched_ts[ativo] = 0.0
+
+                saldo_before = get_available_balance() or 0.0
+                amount_to_use = compute_amount(saldo_before)
+                secs_left = seconds_left_in_period(tf_min)
+
+                # Re-verificar digital/binária antes de cada entrada (respeitando modo OTC)
+                trade_ativo, trade_chave = resolve_trade_variant(ativo, ativo_chave, use_otc=use_otc)
+                market_type_label = "DIGITAL" if trade_chave == 'digital' else "BINÁRIA"
+                direcao_emoji = "📈 CALL" if _direction == "call" else "📉 PUT"
+
+                console_event(
+                    f"🎯 [{_ts_local_disparo}|srv:{server_hhmmss()}] "
+                    f"ENTRADA M{tf_min} | {display_asset_name(ativo)} | "
+                    f"{direcao_emoji} | ${amount_to_use:.2f} | {market_type_label} | "
+                    f"Score={(_pend_info or {}).get('v15_score', 0)} | "
+                    f"sec={_sec_check}/{period} | secs_left={secs_left} | "
+                    f"BUY_LAT={BUY_LATENCY_AVG:.3f}s"
+                )
+
+                result_container: Dict[str, Any] = {}
+                ev = threading.Event()
+                if USE_BUY_THREAD:
+                    t = threading.Thread(
+                        target=_buy_worker,
+                        args=(_direction, trade_ativo, amount_to_use, expiration,
+                              result_container, ev, trade_chave),
+                        daemon=True
+                    )
+                    t.start()
+                    ev.wait(timeout=25.0)
+                else:
+                    status_b, info_b = _do_buy_minimal(
+                        amount_to_use, trade_ativo, _direction, expiration, trade_chave)
+                    result_container["res"] = {
+                        "success": bool(status_b),
+                        "order_id": info_b if status_b else None,
+                        "info": info_b,
+                    }
+
+                res = result_container.get("res", {})
+                if not res.get("success"):
+                    if trade_chave == 'digital':
+                        console_event(
+                            f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
+                            f"Falha ao enviar ordem (DIGITAL). Tentando binária como fallback..."
+                        )
+                    else:
+                        console_event(
+                            f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] Falha ao enviar ordem."
+                        )
+                    # Se falhou no digital, tentar binária como fallback (respeitando modo OTC)
+                    if trade_chave == 'digital':
+                        fb_name, fb_chave = find_preferred_variant_with_rules(
+                            _normalize_asset_name(re.sub(r'[-]?(OTC|OP)$', '', ativo.upper())),
+                            allow_otc=use_otc
+                        )
+                        if fb_name and fb_chave and fb_chave != 'digital':
+                            fb_container: Dict[str, Any] = {}
+                            fb_ev = threading.Event()
+                            if USE_BUY_THREAD:
+                                fb_t = threading.Thread(
+                                    target=_buy_worker,
+                                    args=(_direction, fb_name, amount_to_use, expiration,
+                                          fb_container, fb_ev, fb_chave),
+                                    daemon=True
+                                )
+                                fb_t.start()
+                                fb_ev.wait(timeout=25.0)
+                            else:
+                                fb_s, fb_i = _do_buy_minimal(
+                                    amount_to_use, fb_name, _direction, expiration, fb_chave)
+                                fb_container["res"] = {
+                                    "success": bool(fb_s),
+                                    "order_id": fb_i if fb_s else None,
+                                    "info": fb_i,
+                                }
+                            fb_res = fb_container.get("res", {})
+                            if fb_res.get("success"):
+                                res = fb_res
+                                trade_ativo = fb_name
+                                trade_chave = fb_chave
+                                market_type_label = "BINÁRIA"
+                                console_event(
+                                    f"✅ [{server_hhmmss()}] Fallback BINÁRIA aceito: "
+                                    f"{display_asset_name(fb_name)}"
+                                )
+                    if not res.get("success"):
+                        per_asset_lock_until[ativo] = _now_check + period
+                        _replace_asset(ativo)
+                        break
+
+                # Chegamos aqui apenas quando res.get("success") é True
+                order_id = res.get("order_id")
+                if order_id is not None:
+                    entries_accepted += 1
+                console_event(
+                    f"✅ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
+                    f"Ordem aceita ({market_type_label}) | ID: {order_id} | "
+                    f"Entradas: {entries_accepted}"
+                    + (f"/{max_entries}" if max_entries > 0 else "")
+                )
+                console_event(
+                    f"⏳ [{server_hhmmss()}] [{display_asset_name(ativo)}] Aguardando resultado..."
+                )
+
+                _t0_result = time.time()
+                min_wait = expiration * 60 + RESULT_DELAY_AFTER_EXPIRY_SECONDS
+                while time.time() - _t0_result < min_wait:
+                    time.sleep(0.5)
+
+                timeout = M5_RESULT_TIMEOUT if expiration == 5 else M1_RESULT_TIMEOUT
+                timeout = max(35, timeout)
+
+                result = check_order_result(
+                    order_id, amount_to_use,
+                    saldo_before=saldo_before,
+                    timeout_seconds=timeout,
+                    poll_interval=2.0,
+                )
+
+                label = result.get("result", "unknown")
+                profit = result.get("profit")
+                bal_after = result.get("balance_after")
+                method = result.get("method")
+
+                if label == "win":
+                    per_asset_consec_losses[ativo] = 0
+                    console_event(
+                        f"✅ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
+                        f"{fmt_result_line(label, profit, method)} | Losses seguidos: 0"
+                    )
+                elif label == "loss":
+                    per_asset_consec_losses[ativo] = per_asset_consec_losses.get(ativo, 0) + 1
+                    consec = per_asset_consec_losses[ativo]
+                    if consec >= ASSET_LOSS_COOLDOWN_COUNT:
+                        per_asset_cooldown_until[ativo] = time.time() + ASSET_LOSS_COOLDOWN_SECONDS
+                        per_asset_consec_losses[ativo] = 0
+                        console_event(
+                            f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
+                            f"{fmt_result_line(label, profit, method)} | "
+                            f"⏸️  {consec} losses seguidos → COOLDOWN "
+                            f"{ASSET_LOSS_COOLDOWN_SECONDS // 60}min ativado!"
+                        )
+                    else:
+                        console_event(
+                            f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
+                            f"{fmt_result_line(label, profit, method)} | "
+                            f"Losses seguidos: {consec}/{ASSET_LOSS_COOLDOWN_COUNT}"
+                        )
+                else:
+                    console_event(
+                        f"❓ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
+                        f"{fmt_result_line(label, profit, method)}"
+                    )
+
+                try:
+                    if TRADES_CSV is not None:
+                        with TRADES_CSV.open('a', newline='', encoding='utf-8') as f:
+                            csv.writer(f).writerow([
+                                now_iso(), INSTANCE_TAG,
+                                ativo, tf_min, ENTRY_MODE, RIGIDEZ_MODE,
+                                _direction, order_id,
+                                method, label, float(profit) if profit is not None else "",
+                                saldo_before, bal_after if bal_after is not None else "",
+                                amount_to_use, f"{BUY_LATENCY_AVG:.6f}",
+                                _patt,
+                                (_pend_info or {}).get("pattern_from", ""),
+                                secs_left,
+                                trade_ativo, trade_chave,
+                            ])
+                except Exception:
+                    pass
+
+                per_asset_lock_until[ativo] = get_server_timestamp_safe() + period
+                continue
+
+            if pend is None and per_asset_entry_sched_ts.get(ativo, 0.0) <= 0 \
+                    and candle_id != per_asset_last_idle_cid[ativo]:
                 per_asset_last_idle_cid[ativo] = candle_id
                 console_event(f"⏳ Aguardando... (Ativo: {display_asset_name(ativo)} | TF: M{tf_min})")
 
@@ -3167,208 +3537,31 @@ def loop_patterns_multi(
                     patt = pend["pattern_name"]
                     _log_pattern_row(ativo, tf_min, "confirmed", pend, confirmed=True)
 
-                    ok_win, sec, win = within_entry_window(tf_min)
-                    if not ok_win:
-                        _log_blocked("missed_early_entry", f"ativo={ativo} tf={tf_min}")
-                        console_event(
-                            f"⏰ [{display_asset_name(ativo)}] Sinal perdeu o timing "
-                            f"(sec={sec}s > janela={win}s) — aguardando próximo candle."
-                        )
-                        per_asset_pending[ativo] = None
-                        per_asset_pending_id[ativo] = None
-                        per_asset_lock_until[ativo] = now_server + period
-                        continue
-
-                    if BUY_LATENCY_AVG + BUY_LATENCY_MARGIN >= (win - sec):
-                        _log_blocked("latency_guard", f"ativo={ativo} tf={tf_min}")
-                        console_event(
-                            f"⚡ [{display_asset_name(ativo)}] Latência alta — "
-                            f"margem={BUY_LATENCY_AVG + BUY_LATENCY_MARGIN:.2f}s > "
-                            f"tempo restante={win - sec}s. Pulando entrada."
-                        )
-                        per_asset_pending[ativo] = None
-                        per_asset_pending_id[ativo] = None
-                        per_asset_lock_until[ativo] = now_server + period
-                        continue
-
-                    if not can_purchase_now(ativo, period_minutes=tf_min, chave_preferida=ativo_chave):
-                        _log_blocked("purchase_buffer", f"ativo={ativo} tf={tf_min}")
-                        console_event(
-                            f"🔒 [{display_asset_name(ativo)}] Bloqueado por buffer de compra — "
-                            f"muito próximo do fim do candle."
-                        )
-                        per_asset_pending[ativo] = None
-                        per_asset_pending_id[ativo] = None
-                        per_asset_lock_until[ativo] = now_server + period
-                        continue
-
-                    saldo_before = get_available_balance() or 0.0
-                    amount_to_use = compute_amount(saldo_before)
-                    secs_left = seconds_left_in_period(tf_min)
-
-                    # Re-verificar digital/binária antes de cada entrada (respeitando modo OTC)
-                    trade_ativo, trade_chave = resolve_trade_variant(ativo, ativo_chave, use_otc=use_otc)
-                    market_type_label = "DIGITAL" if trade_chave == 'digital' else "BINÁRIA"
-                    direcao_emoji = "📈 CALL" if direction == "call" else "📉 PUT"
+                    # v8: SINCRONIZAÇÃO NÃO-BLOQUEANTE — agenda disparo para ~s58/s59
+                    # Em vez de comprar imediatamente (que poderia ser em qualquer segundo
+                    # do candle), agendamos o disparo para o momento ideal:
+                    # CANDLE_SYNC_LEAD_SECONDS antes do próximo candle.
+                    # Isso não bloqueia os demais ativos no loop.
+                    fire_at, cur_sec = compute_candle_sync_fire_at(tf_min)
+                    secs_to_wait = max(0.0, fire_at - time.time())
+                    ts_local_confirm = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
                     console_event(
-                        f"🎯 [{server_hhmmss()}] ENTRADA M{tf_min} | {display_asset_name(ativo)} | "
-                        f"{direcao_emoji} | ${amount_to_use:.2f} | {market_type_label} | "
-                        f"Score={pend.get('v15_score', 0)} | {secs_left}s restantes"
+                        f"⏰ [{ts_local_confirm}|srv:{server_hhmmss()}] "
+                        f"[{display_asset_name(ativo)}] Sinal confirmado: {patt} | "
+                        f"{direction.upper()} | sec={cur_sec}/{tf_min * 60} | "
+                        f"Disparo em {secs_to_wait:.1f}s (agendado para s58/59)"
                     )
 
-                    result_container: Dict[str, Any] = {}
-                    ev = threading.Event()
-                    if USE_BUY_THREAD:
-                        t = threading.Thread(
-                            target=_buy_worker,
-                            args=(direction, trade_ativo, amount_to_use, expiration, result_container, ev, trade_chave),
-                            daemon=True
-                        )
-                        t.start()
-                        ev.wait(timeout=25.0)
-                    else:
-                        status_b, info_b = _do_buy_minimal(amount_to_use, trade_ativo, direction, expiration, trade_chave)
-                        result_container["res"] = {
-                            "success": bool(status_b),
-                            "order_id": info_b if status_b else None,
-                            "info": info_b,
-                        }
-
-                    res = result_container.get("res", {})
-                    if not res.get("success"):
-                        if trade_chave == 'digital':
-                            console_event(
-                                f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
-                                f"Falha ao enviar ordem (DIGITAL). Tentando binária como fallback..."
-                            )
-                        else:
-                            console_event(
-                                f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] Falha ao enviar ordem."
-                            )
-                        # Se falhou no digital, tentar binária como fallback (respeitando modo OTC)
-                        if trade_chave == 'digital':
-                            fb_name, fb_chave = find_preferred_variant_with_rules(
-                                _normalize_asset_name(re.sub(r'[-]?(OTC|OP)$', '', ativo.upper())),
-                                allow_otc=use_otc
-                            )
-                            if fb_name and fb_chave and fb_chave != 'digital':
-                                fb_container: Dict[str, Any] = {}
-                                fb_ev = threading.Event()
-                                if USE_BUY_THREAD:
-                                    fb_t = threading.Thread(
-                                        target=_buy_worker,
-                                        args=(direction, fb_name, amount_to_use, expiration, fb_container, fb_ev, fb_chave),
-                                        daemon=True
-                                    )
-                                    fb_t.start()
-                                    fb_ev.wait(timeout=25.0)
-                                else:
-                                    fb_s, fb_i = _do_buy_minimal(amount_to_use, fb_name, direction, expiration, fb_chave)
-                                    fb_container["res"] = {"success": bool(fb_s), "order_id": fb_i if fb_s else None, "info": fb_i}
-                                fb_res = fb_container.get("res", {})
-                                if fb_res.get("success"):
-                                    res = fb_res
-                                    trade_ativo = fb_name
-                                    trade_chave = fb_chave
-                                    market_type_label = "BINÁRIA"
-                                    console_event(
-                                        f"✅ [{server_hhmmss()}] Fallback BINÁRIA aceito: {display_asset_name(fb_name)}"
-                                    )
-                        if not res.get("success"):
-                            per_asset_pending[ativo] = None
-                            per_asset_pending_id[ativo] = None
-                            # Remove ativo imediatamente e busca substituto
-                            _replace_asset(ativo)
-                            break
-
-                    # Chegamos aqui apenas quando res.get("success") é True
-                    order_id = res.get("order_id")
-                    if order_id is not None:
-                        entries_accepted += 1
-                    console_event(
-                        f"✅ [{server_hhmmss()}] [{display_asset_name(ativo)}] Ordem aceita ({market_type_label}) | "
-                        f"ID: {order_id} | Entradas: {entries_accepted}"
-                        + (f"/{max_entries}" if max_entries > 0 else "")
-                    )
-                    console_event(
-                        f"⏳ [{server_hhmmss()}] [{display_asset_name(ativo)}] Aguardando resultado..."
-                    )
-
-                    t0 = time.time()
-                    min_wait = expiration * 60 + RESULT_DELAY_AFTER_EXPIRY_SECONDS
-                    while time.time() - t0 < min_wait:
-                        time.sleep(0.5)
-
-                    timeout = M5_RESULT_TIMEOUT if expiration == 5 else M1_RESULT_TIMEOUT
-                    timeout = max(35, timeout)
-
-                    result = check_order_result(
-                        order_id, amount_to_use,
-                        saldo_before=saldo_before,
-                        timeout_seconds=timeout,
-                        poll_interval=2.0,
-                    )
-
-                    label = result.get("result", "unknown")
-                    profit = result.get("profit")
-                    bal_after = result.get("balance_after")
-                    method = result.get("method")
-
-                    if label == "win":
-                        # Win: zera o contador de losses consecutivos desse ativo
-                        per_asset_consec_losses[ativo] = 0
-                        console_event(
-                            f"✅ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
-                            f"{fmt_result_line(label, profit, method)} | "
-                            f"Losses seguidos: 0"
-                        )
-                    elif label == "loss":
-                        # Loss: incrementa contador e verifica cooldown
-                        per_asset_consec_losses[ativo] = per_asset_consec_losses.get(ativo, 0) + 1
-                        consec = per_asset_consec_losses[ativo]
-                        if consec >= ASSET_LOSS_COOLDOWN_COUNT:
-                            per_asset_cooldown_until[ativo] = time.time() + ASSET_LOSS_COOLDOWN_SECONDS
-                            per_asset_consec_losses[ativo] = 0  # reseta para próxima sequência
-                            console_event(
-                                f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
-                                f"{fmt_result_line(label, profit, method)} | "
-                                f"⏸️  {consec} losses seguidos → COOLDOWN {ASSET_LOSS_COOLDOWN_SECONDS // 60}min ativado!"
-                            )
-                        else:
-                            console_event(
-                                f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
-                                f"{fmt_result_line(label, profit, method)} | "
-                                f"Losses seguidos: {consec}/{ASSET_LOSS_COOLDOWN_COUNT}"
-                            )
-                    else:
-                        console_event(
-                            f"❓ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
-                            f"{fmt_result_line(label, profit, method)}"
-                        )
-
-                    try:
-                        if TRADES_CSV is not None:
-                            with TRADES_CSV.open('a', newline='', encoding='utf-8') as f:
-                                csv.writer(f).writerow([
-                                    now_iso(), INSTANCE_TAG,
-                                    ativo, tf_min, ENTRY_MODE, RIGIDEZ_MODE,
-                                    direction, order_id,
-                                    method, label, float(profit) if profit is not None else "",
-                                    saldo_before, bal_after if bal_after is not None else "",
-                                    amount_to_use, f"{BUY_LATENCY_AVG:.6f}",
-                                    patt, pend.get("pattern_from"),
-                                    secs_left,
-                                    trade_ativo, trade_chave,
-                                ])
-                    except Exception:
-                        pass
+                    per_asset_entry_sched_ts[ativo] = fire_at
+                    per_asset_entry_direction[ativo] = direction
+                    per_asset_entry_patt[ativo] = patt
+                    per_asset_entry_pend[ativo] = pend
 
                     per_asset_pending[ativo] = None
                     per_asset_pending_id[ativo] = None
-                    per_asset_lock_until[ativo] = now_server + period
+                    # Não define lock_until aqui: o lock é definido após o disparo
                     continue
-
             if now_server < lock_until:
                 continue
 
