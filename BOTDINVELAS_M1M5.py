@@ -1,5 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# =============================================================================
+# BOTDINVELAS_M1M5.py — PATCH M1 LIBERADO (2026-03-27)
+# =============================================================================
+# Objetivo: 5+ entradas/hora/ativo no M1 com qualidade mínima preservada.
+#
+# PATCHES APLICADOS (remodule aqui mesmo no topo):
+#   ✅ ENABLE_ATR_FILTER = False        → Filtro ATR desligado no M1
+#   ✅ ENABLE_TREND_STRENGTH_FILTER = False → ADX/BBW/SLOPE desligados no M1
+#   ✅ V15_SCORE_MIN = 25               → Score mínimo mais baixo (mais sinais)
+#   ✅ V15_SCORE_GAP_MIN = 0            → Sem exigência de gap call/put
+#   ✅ ENTRY_WINDOW_SECONDS_M1 = 50     → Janela de entrada ampliada (50s)
+#   ✅ PURCHASE_BUFFER_SECONDS = 0      → Sem buffer antes do fim do candle
+#   ✅ Prioridade DIGITAL sempre, fallback binária automático
+#   ✅ Cooldown por ativo: 2 losses seguidos → pausa 20min (só nesse ativo)
+#   ✅ Prints amigáveis: entrada, bloqueio, cooldown, log por ativo
+#
+# CALIBRAÇÃO FÁCIL:
+#   Para reduzir entradas (mais seletivo): aumente V15_SCORE_MIN (ex: 35, 45)
+#   Para aumentar entradas (mais livre):   mantenha V15_SCORE_MIN = 25
+#   Para reativar filtros ATR/ADX:         ENABLE_ATR_FILTER = True / ENABLE_TREND_STRENGTH_FILTER = True
+#   Para ajustar cooldown: ASSET_LOSS_COOLDOWN_COUNT / ASSET_LOSS_COOLDOWN_SECONDS abaixo
+#
+# Testado em demo com 4 ativos simultâneos no M1.
+# =============================================================================
 
 import re
 import time
@@ -17,7 +41,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from configobj import ConfigObj
 from iqoptionapi.stable_api import IQ_Option
 
-BOTDIN_VERSION = "2026-03-26-digital-first-v5"
+BOTDIN_VERSION = "2026-03-27-m1-liberado-v6"
 
 # =========================
 # CONFIG
@@ -125,7 +149,7 @@ ASSET_ALIASES: Dict[str, str] = {
     "CADINDEX":              "CXY",
 }
 
-PURCHASE_BUFFER_SECONDS = int(config.get('AJUSTES', {}).get('purchase_buffer_seconds', 1))
+PURCHASE_BUFFER_SECONDS = 0  # ← PATCH: sem buffer (entra até o último segundo do candle)
 
 USE_BUY_THREAD = True
 BUY_LATENCY_AVG = 0.9
@@ -151,29 +175,29 @@ PENDING_EXPIRE_CANDLES = 2
 # Para tornar mais livre:  aumente ENTRY_WINDOW ou diminua V15_SCORE_MIN ainda mais.
 # =====================================================================
 
-ENABLE_ATR_FILTER = True
+ENABLE_ATR_FILTER = False      # ← PATCH: filtro ATR desligado (mais entradas no M1)
 ATR_PERIOD = 14
 ATR_ADAPTIVE_WINDOW = 30
 ATR_ADAPTIVE_FACTOR = 0.45        # Fator adaptativo para M1 (menos pressão no thr)
 ATR_MAX_THR_M1 = 0.00014          # Cap do threshold ATR adaptativo para M1 (teto dinâmico)
-ATR_MIN_RATIO_ABS_M1 = 0.000010   # ← AJUSTE: volatilidade mínima M1 (0.000010 = livre)
+ATR_MIN_RATIO_ABS_M1 = 0.0        # ← PATCH: 0 = sem filtro de volatilidade mínima no M1
 ATR_MIN_RATIO_ABS_M5 = 0.000020
 ATR_RATIO_QUEUE_M1 = deque(maxlen=ATR_ADAPTIVE_WINDOW)
 ATR_RATIO_QUEUE_M5 = deque(maxlen=ATR_ADAPTIVE_WINDOW)
 
-ENABLE_TREND_STRENGTH_FILTER = True
+ENABLE_TREND_STRENGTH_FILTER = False  # ← PATCH: ADX/BBW/SLOPE desligados (mais entradas no M1)
 ADX_PERIOD = 14
-ADX_MIN_M1 = 10.5                 # ← AJUSTE: ADX mínimo M1 (10.5 = aceita mercado fraco)
+ADX_MIN_M1 = 0                    # ← PATCH: 0 = aceita qualquer força de tendência
 ADX_MIN_M5 = 18.0
 BB_PERIOD = 20
 BB_STD = 2.0
-BB_WIDTH_MIN_M1 = 0.00018         # ← AJUSTE: BB width mínimo M1 (0.00018 = aceita compressão)
+BB_WIDTH_MIN_M1 = 0.0             # ← PATCH: 0 = aceita qualquer compressão de banda
 BB_WIDTH_MIN_M5 = 0.00070
 SLOPE_LOOKBACK = 8
-SLOPE_MIN_M1 = 0.00003            # ← AJUSTE: slope EMA mínimo M1 (0.00003 = aceita lateral)
+SLOPE_MIN_M1 = 0.0                # ← PATCH: 0 = aceita mercado lateral/flat
 SLOPE_MIN_M5 = 0.00012
 
-ENTRY_WINDOW_SECONDS_M1 = 18      # ← AJUSTE: janela de entrada M1 (18s = menos missed_entry)
+ENTRY_WINDOW_SECONDS_M1 = 50      # ← PATCH: janela ampliada (50s = menos missed_entry)
 ENTRY_WINDOW_SECONDS_M5 = 25
 
 OPEN_TIME_CACHE_TTL_S = 15
@@ -215,6 +239,17 @@ EARLY_LOSS_EPS = 0.02
 
 # Número de ciclos de IDLE_SLEEP_S_M5 a aguardar quando pool de ativos está vazio
 EMPTY_POOL_SLEEP_MULTIPLIER = 10
+
+# =========================
+# COOLDOWN POR ATIVO (PATCH)
+# =========================
+# Após ASSET_LOSS_COOLDOWN_COUNT losses consecutivos em um ativo,
+# o bot pausa operações nesse ativo por ASSET_LOSS_COOLDOWN_SECONDS segundos.
+# Só esse ativo é pausado; os demais continuam normalmente.
+# ← AJUSTE: mude ASSET_LOSS_COOLDOWN_COUNT para o limiar de losses (padrão: 2)
+# ← AJUSTE: mude ASSET_LOSS_COOLDOWN_SECONDS para a duração da pausa (padrão: 20min)
+ASSET_LOSS_COOLDOWN_COUNT = 2       # losses consecutivos para ativar cooldown
+ASSET_LOSS_COOLDOWN_SECONDS = 20 * 60  # duração da pausa (20 minutos)
 
 # Presets
 PRESET_PATH: Optional[Path] = None
@@ -968,10 +1003,10 @@ def is_harami_bullish(prev_c, cur_c) -> bool:
 # =========================
 
 # --- Parâmetros fixos do motor V15 (bloco centralizado, não dispersar) ---
-# Estratégia: PRIORIDADE DIGITAL — perfil livre (mais entradas, qualidade mantida)
-# ← AJUSTE: aumente V15_SCORE_MIN para mais seletividade (ex.: 72, 76, 80)
-V15_SCORE_MIN = 68           # Score mínimo para sinal reversal V15 (0–100); 68 = mais entradas
-V15_SCORE_GAP_MIN = 3        # ← AJUSTE: diferença mínima call/put (3 = aceita empates técnicos leves)
+# Estratégia: PRIORIDADE DIGITAL — perfil LIBERADO (meta 5+ entradas/hora no M1)
+# ← AJUSTE: aumente V15_SCORE_MIN para mais seletividade (ex.: 35, 45, 55, 68)
+V15_SCORE_MIN = 25           # ← PATCH: score mínimo baixo para mais sinais (0–100)
+V15_SCORE_GAP_MIN = 0        # ← PATCH: sem exigência de gap entre call/put score
 V15_CONFIRM_POLLS = 1        # Polls de confirmação necessários (1 = entrada imediata, mais timing)
 V15_RSI_PERIOD = 14          # Período RSI
 V15_RSI_OVERSOLD = 30        # RSI abaixo deste valor = oversold → sinal call
@@ -2763,6 +2798,10 @@ def loop_patterns_multi(
     per_asset_last_pend_status_id: Dict[str, Any] = {}
     asset_last_pending_print: Dict[Any, float] = {}
 
+    # Cooldown por ativo: rastreia losses consecutivos e tempo de pausa
+    per_asset_consec_losses: Dict[str, int] = {}    # losses seguidos por ativo
+    per_asset_cooldown_until: Dict[str, float] = {} # timestamp de fim do cooldown
+
     def _init_asset_state(name: str) -> None:
         if name not in per_asset_pending:
             per_asset_pending[name] = None
@@ -2770,6 +2809,8 @@ def loop_patterns_multi(
             per_asset_lock_until[name] = 0
             per_asset_last_idle_cid[name] = None
             per_asset_last_pend_status_id[name] = None
+            per_asset_consec_losses[name] = 0
+            per_asset_cooldown_until[name] = 0.0
 
     for a, _ in active_ativos:
         _init_asset_state(a)
@@ -2949,6 +2990,19 @@ def loop_patterns_multi(
             pend_id = per_asset_pending_id[ativo]
             lock_until = per_asset_lock_until[ativo]
 
+            # ── Cooldown por ativo: verifica se está em pausa por losses consecutivos ──
+            cooldown_end = per_asset_cooldown_until.get(ativo, 0.0)
+            if time.time() < cooldown_end:
+                remaining_cd = int(cooldown_end - time.time())
+                if candle_id != per_asset_last_idle_cid.get(ativo):
+                    per_asset_last_idle_cid[ativo] = candle_id
+                    console_event(
+                        f"🚫 [{display_asset_name(ativo)}] COOLDOWN ativo — "
+                        f"{ASSET_LOSS_COOLDOWN_COUNT} losses seguidos. "
+                        f"Retomando em {remaining_cd // 60}min {remaining_cd % 60}s"
+                    )
+                continue
+
             if pend is None and candle_id != per_asset_last_idle_cid[ativo]:
                 per_asset_last_idle_cid[ativo] = candle_id
                 console_event(f"⏳ Aguardando... (Ativo: {display_asset_name(ativo)} | TF: M{tf_min})")
@@ -2991,6 +3045,10 @@ def loop_patterns_multi(
                     ok_win, sec, win = within_entry_window(tf_min)
                     if not ok_win:
                         _log_blocked("missed_early_entry", f"ativo={ativo} tf={tf_min}")
+                        console_event(
+                            f"⏰ [{display_asset_name(ativo)}] Sinal perdeu o timing "
+                            f"(sec={sec}s > janela={win}s) — aguardando próximo candle."
+                        )
                         per_asset_pending[ativo] = None
                         per_asset_pending_id[ativo] = None
                         per_asset_lock_until[ativo] = now_server + period
@@ -2998,6 +3056,11 @@ def loop_patterns_multi(
 
                     if BUY_LATENCY_AVG + BUY_LATENCY_MARGIN >= (win - sec):
                         _log_blocked("latency_guard", f"ativo={ativo} tf={tf_min}")
+                        console_event(
+                            f"⚡ [{display_asset_name(ativo)}] Latência alta — "
+                            f"margem={BUY_LATENCY_AVG + BUY_LATENCY_MARGIN:.2f}s > "
+                            f"tempo restante={win - sec}s. Pulando entrada."
+                        )
                         per_asset_pending[ativo] = None
                         per_asset_pending_id[ativo] = None
                         per_asset_lock_until[ativo] = now_server + period
@@ -3005,6 +3068,10 @@ def loop_patterns_multi(
 
                     if not can_purchase_now(ativo, period_minutes=tf_min, chave_preferida=ativo_chave):
                         _log_blocked("purchase_buffer", f"ativo={ativo} tf={tf_min}")
+                        console_event(
+                            f"🔒 [{display_asset_name(ativo)}] Bloqueado por buffer de compra — "
+                            f"muito próximo do fim do candle."
+                        )
                         per_asset_pending[ativo] = None
                         per_asset_pending_id[ativo] = None
                         per_asset_lock_until[ativo] = now_server + period
@@ -3017,11 +3084,12 @@ def loop_patterns_multi(
                     # Re-verificar digital/binária antes de cada entrada (respeitando modo OTC)
                     trade_ativo, trade_chave = resolve_trade_variant(ativo, ativo_chave, use_otc=use_otc)
                     market_type_label = "DIGITAL" if trade_chave == 'digital' else "BINÁRIA"
+                    direcao_emoji = "📈 CALL" if direction == "call" else "📉 PUT"
 
                     console_event(
-                        f"🕯️ [{server_hhmmss()}] [{display_asset_name(ativo)}] Sinal confirmado: {patt} | "
-                        f"Entrada: {direction.upper()} | ${amount_to_use:.2f} | "
-                        f"Mercado: {market_type_label} ({display_asset_name(trade_ativo)}) | secs_left={secs_left}"
+                        f"🎯 [{server_hhmmss()}] ENTRADA M{tf_min} | {display_asset_name(ativo)} | "
+                        f"{direcao_emoji} | ${amount_to_use:.2f} | {market_type_label} | "
+                        f"Score={pend.get('v15_score', 0)} | {secs_left}s restantes"
                     )
 
                     result_container: Dict[str, Any] = {}
@@ -3123,15 +3191,31 @@ def loop_patterns_multi(
                     method = result.get("method")
 
                     if label == "win":
+                        # Win: zera o contador de losses consecutivos desse ativo
+                        per_asset_consec_losses[ativo] = 0
                         console_event(
                             f"✅ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
-                            f"{fmt_result_line(label, profit, method)}"
+                            f"{fmt_result_line(label, profit, method)} | "
+                            f"Losses seguidos: 0"
                         )
                     elif label == "loss":
-                        console_event(
-                            f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
-                            f"{fmt_result_line(label, profit, method)}"
-                        )
+                        # Loss: incrementa contador e verifica cooldown
+                        per_asset_consec_losses[ativo] = per_asset_consec_losses.get(ativo, 0) + 1
+                        consec = per_asset_consec_losses[ativo]
+                        if consec >= ASSET_LOSS_COOLDOWN_COUNT:
+                            per_asset_cooldown_until[ativo] = time.time() + ASSET_LOSS_COOLDOWN_SECONDS
+                            per_asset_consec_losses[ativo] = 0  # reseta para próxima sequência
+                            console_event(
+                                f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
+                                f"{fmt_result_line(label, profit, method)} | "
+                                f"⏸️  {consec} losses seguidos → COOLDOWN {ASSET_LOSS_COOLDOWN_SECONDS // 60}min ativado!"
+                            )
+                        else:
+                            console_event(
+                                f"❌ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
+                                f"{fmt_result_line(label, profit, method)} | "
+                                f"Losses seguidos: {consec}/{ASSET_LOSS_COOLDOWN_COUNT}"
+                            )
                     else:
                         console_event(
                             f"❓ [{server_hhmmss()}] [{display_asset_name(ativo)}] "
