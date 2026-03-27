@@ -15,6 +15,13 @@
 #   ✅ Prioridade DIGITAL sempre, fallback binária automático
 #   ✅ Cooldown por ativo: 2 losses seguidos → pausa 20min (só nesse ativo)
 #   ✅ Prints amigáveis: entrada, bloqueio, cooldown, log por ativo
+#   ✅ v7: ensure_connected() — reconexão automática ao detectar queda de conexão
+#   ✅ v7: get_candles_safe() — trata "Timeout while waiting for candles data"
+#          com log amigável e tentativa de reconexão antes de retentativa
+#   ✅ v7: get_server_timestamp_safe() — evita crash no loop principal por falha
+#          de rede ao obter timestamp; faz fallback para relógio local
+#   ✅ v7: _SuppressIQTimeoutFilter — suprime logs ERROR ruidosos da iqoptionapi
+#          ("Timeout while waiting for candles data", "error from callback")
 #
 # CALIBRAÇÃO FÁCIL:
 #   Para reduzir entradas (mais seletivo): aumente V15_SCORE_MIN (ex: 35, 45)
@@ -25,6 +32,7 @@
 # Testado em demo com 4 ativos simultâneos no M1.
 # =============================================================================
 
+import logging
 import re
 import time
 import json
@@ -41,7 +49,47 @@ from typing import List, Optional, Dict, Any, Tuple
 from configobj import ConfigObj
 from iqoptionapi.stable_api import IQ_Option
 
-BOTDIN_VERSION = "2026-03-27-m1-liberado-v6"
+BOTDIN_VERSION = "2026-03-27-m1-liberado-v7"
+
+# =========================
+# SUPRIMIR RUÍDOS DE LOG
+# =========================
+# O websocket-client loga "error from callback" como ERROR mesmo quando a
+# iqoptionapi trata o erro internamente. Rebaixamos para WARNING para não
+# poluir o terminal do usuário com mensagens assustadoras sem consequência.
+# A iqoptionapi loga "Timeout while waiting for candles data" como ERROR via
+# logging.error(). Os erros reais do bot ficam no arquivo de log (ERRORS_LOG)
+# via _log_error(); o ruído da biblioteca é filtrado em _install_iq_noise_filter().
+_iq_noise_filter_installed = False
+
+RECONNECT_BASE_DELAY_SEC = 5    # segundos base de espera entre tentativas de reconexão
+RECONNECT_MAX_DELAY_SEC = 30    # espera máxima entre tentativas de reconexão
+
+
+class _SuppressIQTimeoutFilter(logging.Filter):
+    """Filtra mensagens de timeout/callback da iqoptionapi que são ruído."""
+    _PATTERNS = (
+        "timeout while waiting for candles",
+        "error from callback",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        msg = record.getMessage().lower()
+        for pat in self._PATTERNS:
+            if pat in msg:
+                return False
+        return True
+
+
+def _install_iq_noise_filter():
+    global _iq_noise_filter_installed
+    if _iq_noise_filter_installed:
+        return
+    _f = _SuppressIQTimeoutFilter()
+    logging.getLogger("").addFilter(_f)     # root logger (getLogger("") == getLogger())
+    logging.getLogger("websocket").addFilter(_f)
+    logging.getLogger("websocket").setLevel(logging.WARNING)
+    _iq_noise_filter_installed = True
 
 # =========================
 # CONFIG
@@ -472,6 +520,7 @@ def write_preset_file(preset_path: Path, preset_data: Dict[str, Any]):
 # =========================
 def connect():
     global API
+    _install_iq_noise_filter()
     print('BOTDIN_VERSION =', BOTDIN_VERSION)
     print('🔌 Conectando na IQ Option...')
     API = IQ_Option(email, senha)
@@ -480,6 +529,55 @@ def connect():
         print('\n❌ Falha na conexão:', reason)
         sys.exit(1)
     print('✅ Conectado.')
+
+
+def ensure_connected(max_tentativas: int = 5) -> bool:
+    """Verifica se a conexão está ativa e reconecta automaticamente se necessário.
+
+    Retorna True se a conexão está OK (ou foi restabelecida), False se não
+    foi possível reconectar após *max_tentativas* tentativas.
+
+    Chamada por get_candles_safe() e pelo loop principal sempre que um erro
+    de rede/timeout é detectado, evitando que o bot trave silenciosamente.
+    """
+    global API
+    for attempt in range(1, max_tentativas + 1):
+        try:
+            if API is not None and API.check_connect():
+                return True
+        except Exception:
+            pass
+        wait = min(RECONNECT_BASE_DELAY_SEC * attempt, RECONNECT_MAX_DELAY_SEC)
+        print(
+            f"⚠️  Conexão com IQ Option perdida. "
+            f"Tentando reconectar ({attempt}/{max_tentativas}) em {wait}s..."
+        )
+        _log_error(f"Reconexão automática — tentativa {attempt}/{max_tentativas}.")
+        time.sleep(wait)
+        try:
+            API = IQ_Option(email, senha)
+            ok, reason = API.connect()
+            if ok:
+                print(f"✅ Reconectado com sucesso (tentativa {attempt}).")
+                return True
+            print(f"❌ Reconexão falhou: {reason}")
+        except Exception as e:
+            _log_error("Erro durante tentativa de reconexão.", e)
+    print("❌ Não foi possível reconectar após todas as tentativas.")
+    return False
+
+
+def get_server_timestamp_safe() -> int:
+    """Retorna o timestamp do servidor IQ Option com fallback para hora local.
+
+    Em caso de falha (timeout/desconexão), loga o erro e retorna int(time.time())
+    para que o loop principal não quebre com uma exceção não tratada.
+    """
+    try:
+        return int(API.get_server_timestamp())
+    except Exception as e:
+        _log_error("Falha ao obter timestamp do servidor; usando hora local.", e)
+        return int(time.time())
 
 
 def get_profile_name() -> str:
@@ -704,15 +802,42 @@ def can_purchase_now(ativo, period_minutes=1, chave_preferida=None):
 
 
 def get_candles_safe(ativo: str, timeframe: int, qnt: int, max_tentativas=6):
-    for _ in range(max_tentativas):
+    """Busca candles com retentativas e reconexão automática.
+
+    Trata especificamente o erro "Timeout while waiting for candles data"
+    da iqoptionapi: ao detectá-lo, tenta reconectar antes de tentar novamente,
+    evitando que o bot trave silenciosamente em loop após queda de conexão.
+    """
+    for attempt in range(max_tentativas):
         try:
             end_ts = API.get_server_timestamp()
             velas = API.get_candles(ativo, timeframe, qnt, end_ts)
             if velas and len(velas) >= qnt:
                 return velas
+            # Retorno vazio sem exceção: pequena pausa antes de tentar novamente
+            time.sleep(0.5)
         except Exception as e:
-            _log_error("Erro ao buscar candles.", e)
-        time.sleep(0.5)
+            err_msg = str(e).lower()
+            is_timeout = "timeout" in err_msg and "candles" in err_msg
+            if is_timeout:
+                print(
+                    f"⚠️  [{ativo}] Timeout ao buscar candles "
+                    f"(tentativa {attempt + 1}/{max_tentativas}). "
+                    "Verificando conexão..."
+                )
+                _log_error(f"Timeout ao buscar candles — ativo={ativo} tf={timeframe}.", e)
+                if not ensure_connected():
+                    # Sem conexão: aguarda mais antes de nova tentativa
+                    time.sleep(3.0)
+                else:
+                    time.sleep(1.0)
+            else:
+                _log_error("Erro ao buscar candles.", e)
+                time.sleep(0.5)
+    _log_error(
+        f"get_candles_safe: retornando None após {max_tentativas} tentativas "
+        f"— ativo={ativo} tf={timeframe}."
+    )
     return None
 
 
@@ -1463,7 +1588,7 @@ def confirm_pending(tf_min: int, pending: Dict[str, Any], velas: List[Dict[str, 
     direction_hint = pending.get("direction_hint", "call")
     pattern_mode = pending.get("pattern_mode", "fallback")
 
-    now_server = int(API.get_server_timestamp())
+    now_server = get_server_timestamp_safe()
     if now_server >= expire_from + 2:
         return "expired", None
 
@@ -2566,7 +2691,7 @@ def loop_patterns(ativo: str, ativo_chave: str, tf_min: int, runtime_seconds: Op
             console_event("🎯 STOP WIN atingido. Encerrando...")
             break
 
-        now_server = int(API.get_server_timestamp())
+        now_server = get_server_timestamp_safe()
         candle_id = now_server // period
 
         if pending is None and candle_id != last_idle_candle_id:
@@ -2970,7 +3095,7 @@ def loop_patterns_multi(
             )
             break
 
-        now_server = int(API.get_server_timestamp())
+        now_server = get_server_timestamp_safe()
         candle_id = now_server // period
 
         # Recheck completo do pool a cada novo candle (sem ban permanente)
