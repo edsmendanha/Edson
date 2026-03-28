@@ -11,7 +11,6 @@ Ordens: DIGITAL usa buy_digital_spot_v2; BINARIA usa buy
 from __future__ import annotations
 
 import csv
-import os
 import sys
 import time
 import threading
@@ -19,6 +18,7 @@ import importlib.util
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
+
 
 # ---------------------------------------------------------------------------
 # 0. Garante que o diretório raiz do projeto está no sys.path
@@ -51,7 +51,7 @@ def _apply_ws_patch(enable: bool = True) -> None:
         WebsocketClient.on_message = _patched
         print("[WS patch] ON   (WebsocketClient.on_message normalizado)")
     except (ImportError, AttributeError):
-        pass  # iqoptionapi ausente ou sem patch necessário
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +147,6 @@ def load_assets_by_section(path: str = "Ativos.txt") -> dict[str, list[str]]:
                 current_section = section_name if section_name in VALID_SECTIONS else None
             elif current_section is not None:
                 result[current_section].append(line)
-            # ativos fora de seção reconhecida são silenciosamente ignorados
 
     return result
 
@@ -160,8 +159,6 @@ def normalize_asset(raw: str, market: str) -> Optional[str]:
       - Sem sufixo  → append '-op' (OP) ou '-OTC' (OTC) com base no mercado do menu
       - Com -op / -OP / -Op  → normaliza para '-op'
       - Com -otc / -OTC / -Otc → normaliza para '-OTC'
-
-    Retorna None se o nome for inválido (vazio, etc.).
     """
     raw = raw.strip()
     if not raw:
@@ -175,7 +172,6 @@ def normalize_asset(raw: str, market: str) -> Optional[str]:
         base = raw[: len(raw) - 3].upper()
         suffix = "-op"
     else:
-        # sem sufixo → usa mercado selecionado
         base = upper
         suffix = "-op" if market == "op" else "-OTC"
 
@@ -187,10 +183,7 @@ def normalize_asset(raw: str, market: str) -> Optional[str]:
 def filter_assets_for_market(raw_assets: list[str], market: str) -> list[tuple[str, str]]:
     """
     Normaliza e filtra ativos para o mercado selecionado (op ou otc).
-
-    Retorna lista de (asset_key, api_asset):
-      asset_key : 'EURJPY-op' ou 'EURJPY-OTC'  (para logs/controle)
-      api_asset : 'EURJPY'    (OP)  ou  'EURJPY-OTC'  (OTC)  (para chamar API)
+    Retorna lista de (asset_key, api_asset).
     """
     result: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -198,7 +191,6 @@ def filter_assets_for_market(raw_assets: list[str], market: str) -> list[tuple[s
         norm = normalize_asset(raw, market)
         if norm is None:
             continue
-        # filtra pelo mercado selecionado
         if market == "op" and not norm.endswith("-op"):
             continue
         if market == "otc" and not norm.endswith("-OTC"):
@@ -214,8 +206,6 @@ def filter_assets_for_market(raw_assets: list[str], market: str) -> list[tuple[s
 def asset_key_to_api(asset_key: str) -> str:
     """
     Converte asset_key para o nome que a API da IQ Option aceita.
-      EURJPY-op  → EURJPY       (OP: strip -op)
-      EURJPY-OTC → EURJPY-OTC  (OTC: mantém)
     """
     if asset_key.endswith("-OTC"):
         return asset_key
@@ -246,8 +236,8 @@ class SessionLogger:
 
     def __init__(self, log_dir: str = "logs", session_tag: str = "") -> None:
         today = date.today().isoformat()
-        ts    = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        tag   = f"_{session_tag}" if session_tag else ""
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        tag = f"_{session_tag}" if session_tag else ""
 
         day_folder = Path(log_dir) / today
         day_folder.mkdir(parents=True, exist_ok=True)
@@ -259,16 +249,15 @@ class SessionLogger:
             csv.DictWriter(fh, fieldnames=self.SIGNAL_COLS).writeheader()
 
         self._log_fh = open(self._log_path, "a", encoding="utf-8", buffering=1)
-        self._lock   = threading.Lock()
+        self._lock = threading.Lock()
         self._event(f"Sessão iniciada | csv={self._csv_path.name}")
-
-    # --- API pública ---
 
     def write_signal(self, row: dict) -> None:
         with self._lock:
             with open(self._csv_path, "a", newline="", encoding="utf-8") as fh:
-                csv.DictWriter(fh, fieldnames=self.SIGNAL_COLS,
-                               extrasaction="ignore").writerow(row)
+                csv.DictWriter(
+                    fh, fieldnames=self.SIGNAL_COLS, extrasaction="ignore"
+                ).writerow(row)
 
     def event(self, msg: str) -> None:
         self._event(msg)
@@ -277,99 +266,70 @@ class SessionLogger:
         self._event("Sessão encerrada")
         self._log_fh.close()
 
-    # --- Interno ---
-
     def _event(self, msg: str) -> None:
-        ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {msg}\n"
         with self._lock:
             self._log_fh.write(line)
 
 
 # ---------------------------------------------------------------------------
-# 6. CONEXÃO IQ OPTION
+# 6. CONEXÃO IQ OPTION (SEM THREAD/TIMEOUT HARD - estilo BOT M1/M5)
 # ---------------------------------------------------------------------------
 
-def _connect_once(iq, timeout: int = 30) -> tuple[bool, str]:
+RECONNECT_BASE_DELAY_SEC = 5
+RECONNECT_MAX_DELAY_SEC = 30
+
+
+def connect_iq(email: str, senha: str, tipo_conta: str, max_retries: int = 5):
     """
-    Tenta conectar um objeto IQ_Option com timeout hard.
-    Retorna (sucesso, motivo_falha).
-    """
-    connected = threading.Event()
-    conn_result: list = []
-
-    def _do():
-        try:
-            result, reason = iq.connect()
-            conn_result.append((result, str(reason)))
-        except Exception as exc:
-            conn_result.append((False, str(exc)))
-        finally:
-            connected.set()
-
-    t = threading.Thread(target=_do, daemon=True)
-    t.start()
-    connected.wait(timeout=timeout)
-
-    if not connected.is_set():
-        return False, "timeout"
-    if conn_result:
-        return conn_result[0]
-    return False, "sem_resposta"
-
-
-def connect_iq(email: str, senha: str, tipo_conta: str,
-               max_retries: int = 3, timeout: int = 30):
-    """
-    Cria e conecta IQ_Option com retries e backoff exponencial.
-    Retorna (iq_object, True) em sucesso, (None, False) em falha.
+    Conexão direta:
+      - IQ_Option(email, senha)
+      - ok, reason = connect()
+      - sleep(1)
+      - change_balance()
+    Retorna (iq, True/False).
     """
     from iqoptionapi.stable_api import IQ_Option  # type: ignore
 
+    tipo = tipo_conta.upper()
+
     for attempt in range(1, max_retries + 1):
-        print(f"[CONN] Tentativa {attempt}/{max_retries} ({tipo_conta.upper()})...")
-        iq = IQ_Option(email, senha)
-        ok, reason = _connect_once(iq, timeout=timeout)
+        print(f"[CONN] Tentativa {attempt}/{max_retries} ({tipo})...")
+        try:
+            iq = IQ_Option(email, senha)
+            ok, reason = iq.connect()
+            if ok:
+                time.sleep(1.0)
+                iq.change_balance(tipo)
+                print(f"[CONN] Conectado! Conta: {tipo}")
+                return iq, True
+            print(f"[CONN] Falha: {reason}")
+        except Exception as exc:
+            print(f"[CONN] Falha: {exc}")
 
-        if ok:
-            iq.change_balance(tipo_conta.upper())
-            print(f"[CONN] Conectado! Conta: {tipo_conta.upper()}")
-            return iq, True
-
-        print(f"[CONN] Falha: {reason}")
         if attempt < max_retries:
-            backoff = 5 * attempt
-            print(f"[CONN] Aguardando {backoff}s antes de nova tentativa...")
-            time.sleep(backoff)
+            wait = min(RECONNECT_BASE_DELAY_SEC * attempt, RECONNECT_MAX_DELAY_SEC)
+            print(f"[CONN] Aguardando {wait}s antes de nova tentativa...")
+            time.sleep(wait)
 
     return None, False
 
 
-def ensure_connected(iq, tipo_conta: str, max_retries: int = 3) -> bool:
+def ensure_connected(iq, email: str, senha: str, tipo_conta: str, max_retries: int = 5):
     """
-    Verifica se a conexão está ativa. Reconecta se necessário.
-    Usa o mesmo objeto iq (credenciais já internas na lib).
+    Se caiu, reconecta recriando o objeto IQ_Option.
+    Retorna (iq_atualizado, ok).
     """
     try:
-        if iq.check_connect():
-            return True
+        if iq is not None and iq.check_connect():
+            return iq, True
     except Exception:
         pass
 
     print("[CONN] Conexão perdida. Reconectando...")
-    for attempt in range(1, max_retries + 1):
-        ok, reason = _connect_once(iq, timeout=30)
-        if ok:
-            iq.change_balance(tipo_conta.upper())
-            print(f"[CONN] Reconectado! (tentativa {attempt})")
-            return True
-        backoff = 5 * attempt
-        print(f"[CONN] Reconexão {attempt}/{max_retries} falhou ({reason}). "
-              f"Aguardando {backoff}s...")
-        if attempt < max_retries:
-            time.sleep(backoff)
-
-    return False
+    iq2, ok = connect_iq(email, senha, tipo_conta, max_retries=max_retries)
+    return (iq2 if ok else iq), bool(ok)
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +337,6 @@ def ensure_connected(iq, tipo_conta: str, max_retries: int = 3) -> bool:
 # ---------------------------------------------------------------------------
 
 def _get_open_time(iq) -> dict:
-    """Retorna dicionário get_all_open_time() ou {} em caso de erro."""
     try:
         data = iq.get_all_open_time()
         return data or {}
@@ -386,17 +345,11 @@ def _get_open_time(iq) -> dict:
 
 
 def _is_asset_open(api_asset: str, option_type: str, open_time: dict) -> bool:
-    """
-    Verifica se o ativo está aberto.
-    option_type: 'digital' → seção 'digital';
-                 'binary'  → seção 'turbo' (nome usado pela IQ Option API)
-    """
     if not open_time:
         return False
     if option_type == "digital":
         section = open_time.get("digital", {})
     else:
-        # binary turbo / binary
         section = open_time.get("turbo", open_time.get("binary", {}))
 
     info = section.get(api_asset, {})
@@ -408,14 +361,6 @@ def build_pool(digital_assets: list[tuple[str, str]],
                n_assets: int,
                iq,
                logger: SessionLogger) -> list[dict]:
-    """
-    Constrói pool de até N ativos: DIGITAL primeiro, depois BINARIA.
-    Aguarda 60 s se nenhum ativo estiver aberto.
-
-    Retorna lista de dicts:
-      {'asset_key': str, 'api_asset': str, 'option_type': 'digital'|'binary'}
-    """
-    # Stub mode: sem verificação de abertura
     if iq is None:
         pool: list[dict] = []
         for ak, api in digital_assets:
@@ -457,11 +402,9 @@ def build_pool(digital_assets: list[tuple[str, str]],
 def _log_pool(pool: list[dict], logger: SessionLogger) -> None:
     logger.event(f"Pool construído: {len(pool)} ativo(s)")
     for item in pool:
-        line = (f"  {item['asset_key']} → api={item['api_asset']} "
-                f"({item['option_type']})")
+        line = f"  {item['asset_key']} → api={item['api_asset']} ({item['option_type']})"
         logger.event(line)
-        print(f"[POOL] {item['asset_key']} → {item['api_asset']} "
-              f"({item['option_type'].upper()})")
+        print(f"[POOL] {item['asset_key']} → {item['api_asset']} ({item['option_type'].upper()})")
 
 
 # ---------------------------------------------------------------------------
@@ -469,46 +412,32 @@ def _log_pool(pool: list[dict], logger: SessionLogger) -> None:
 # ---------------------------------------------------------------------------
 
 def _ema(prices: list[float], period: int) -> Optional[float]:
-    """EMA sem pandas. Retorna None se histórico insuficiente."""
     if len(prices) < period:
         return None
-    k   = 2.0 / (period + 1)
+    k = 2.0 / (period + 1)
     ema = sum(prices[:period]) / period
     for p in prices[period:]:
         ema = p * k + ema * (1.0 - k)
     return round(ema, 6)
 
 
-def _donchian(highs: list[float], lows: list[float],
-              period: int) -> tuple[Optional[float], Optional[float]]:
+def _donchian(highs: list[float], lows: list[float], period: int) -> tuple[Optional[float], Optional[float]]:
     if len(highs) < period or len(lows) < period:
         return None, None
     return round(max(highs[-period:]), 6), round(min(lows[-period:]), 6)
 
 
-def compute_indicators(closes: list[float], highs: list[float],
-                       lows: list[float], periods: dict) -> dict:
-    """
-    Calcula todos os indicadores necessários.
-
-    TODO: ajuste a lógica de ENC/ENV conforme o QuadCode original ao
-          integrar os parâmetros definitivos de enc_percent.
-    """
+def compute_indicators(closes: list[float], highs: list[float], lows: list[float], periods: dict) -> dict:
     result = {
         "ema_a": _ema(closes, periods["ema_a"]),
         "ema_b": _ema(closes, periods["ema_b"]),
         "ema_c": _ema(closes, periods["ema_c"]),
         "ema_d": _ema(closes, periods["ema_d"]),
     }
-    result["donchian_up"], result["donchian_dn"] = _donchian(
-        highs, lows, periods["donchian"]
-    )
-
-    # TA / TB: EMA dos máximos/mínimos
+    result["donchian_up"], result["donchian_dn"] = _donchian(highs, lows, periods["donchian"])
     result["ta"] = _ema(highs, periods["ta"])
-    result["tb"] = _ema(lows,  periods["tb"])
+    result["tb"] = _ema(lows, periods["tb"])
 
-    # ENC / ENV: envelope em torno de ema_b
     mid = result["ema_b"]
     pct = float(periods.get("enc_percent", 0.001))
     if mid is not None:
@@ -517,7 +446,6 @@ def compute_indicators(closes: list[float], highs: list[float],
     else:
         result["enc"] = None
         result["env"] = None
-
     return result
 
 
@@ -526,19 +454,6 @@ def compute_indicators(closes: list[float], highs: list[float],
 # ---------------------------------------------------------------------------
 
 def check_signal(ind: dict, price: float) -> dict:
-    """
-    Avalia indicadores e retorna sinal.
-
-    TODO: implemente aqui a lógica completa de confirmação do QuadCode
-          (EMA ordering, Donchian breakout, ENC/ENV confirmation, TA/TB).
-
-    Retorna dict:
-      direction           : "CALL" | "PUT" | None
-      confirmed           : bool
-      confidence          : float (0–100)
-      reason              : str
-      tendencia_confirmada: bool
-    """
     required = ["ema_a", "ema_b", "ema_c", "ema_d",
                 "donchian_up", "donchian_dn", "ta", "tb", "enc", "env"]
     if any(ind.get(k) is None for k in required):
@@ -548,23 +463,20 @@ def check_signal(ind: dict, price: float) -> dict:
         }
 
     ea, eb, ec, ed = ind["ema_a"], ind["ema_b"], ind["ema_c"], ind["ema_d"]
-    dup, ddn       = ind["donchian_up"], ind["donchian_dn"]
-    ta, tb         = ind["ta"], ind["tb"]
-    enc, env_      = ind["enc"], ind["env"]
+    dup, ddn = ind["donchian_up"], ind["donchian_dn"]
+    ta, tb = ind["ta"], ind["tb"]
+    enc, env_ = ind["enc"], ind["env"]
 
-    # --- Tendência confirmada (alinhamento das 4 EMAs) ---
-    trend_up   = ea > eb > ec > ed
+    trend_up = ea > eb > ec > ed
     trend_down = ea < eb < ec < ed
     tendencia_confirmada = trend_up or trend_down
 
-    # --- Filtros ---
-    # TODO: refine estes filtros com a lógica definitiva do QuadCode
-    call_filters = [trend_up,   price > dup, price > enc, ta > tb]
-    put_filters  = [trend_down, price < ddn, price < env_, ta < tb]
+    call_filters = [trend_up, price > dup, price > enc, ta > tb]
+    put_filters = [trend_down, price < ddn, price < env_, ta < tb]
 
     call_score = sum(call_filters)
-    put_score  = sum(put_filters)
-    total      = len(call_filters)
+    put_score = sum(put_filters)
+    total = len(call_filters)
 
     if call_score == total:
         return {
@@ -602,17 +514,12 @@ def check_signal(ind: dict, price: float) -> dict:
 # ---------------------------------------------------------------------------
 
 class EntryManager:
-    """
-    Controla entradas aceitas e verifica stop win/loss.
-    MAX_ENTRIES conta apenas ordens aceitas (não sinais parciais).
-    """
-
     def __init__(self, max_entries: int, stop_win: float, stop_loss: float) -> None:
-        self.max_entries = max_entries   # 0 = sem limite
-        self.stop_win    = stop_win      # 0 = desabilitado
-        self.stop_loss   = stop_loss     # 0 = desabilitado
-        self._accepted   = 0
-        self._pnl        = 0.0
+        self.max_entries = max_entries
+        self.stop_win = stop_win
+        self.stop_loss = stop_loss
+        self._accepted = 0
+        self._pnl = 0.0
 
     @property
     def accepted(self) -> int:
@@ -628,67 +535,49 @@ class EntryManager:
         return True, ""
 
     def register_entry(self, pnl_result: float = 0.0) -> None:
-        """Registra entrada aceita. pnl_result=0 enquanto ordem não resolve."""
         self._accepted += 1
-        self._pnl      += pnl_result
+        self._pnl += pnl_result
 
 
 # ---------------------------------------------------------------------------
-# 11. EXECUÇÃO DE ORDEM
+# 11. EXECUÇÃO DE ORDEM (agora retorna accepted)
 # ---------------------------------------------------------------------------
 
 def execute_order(iq, item: dict, direction: str, valor: float,
-                  tf: int, logger: SessionLogger) -> float:
-    """
-    Executa ordem na IQ Option.
-      DIGITAL: buy_digital_spot_v2(api_asset, amount, direction, duration_minutes)
-      BINARY : buy(amount, api_asset, direction, expiration_minutes)
-
-    Retorna 0.0 (pnl real obtido via polling separado; não implementado aqui).
-    Se iq=None, opera em modo STUB (sem envio real).
-    """
-    asset_key   = item["asset_key"]
-    api_asset   = item["api_asset"]
+                  tf: int, logger: SessionLogger) -> tuple[bool, float]:
+    asset_key = item["asset_key"]
+    api_asset = item["api_asset"]
     option_type = item["option_type"]
 
     if iq is None:
         logger.event(
-            f"[STUB] ORDEM  ativo={asset_key}  api={api_asset}  dir={direction}  "
-            f"valor={valor:.2f}  tf={tf}m  tipo={option_type}"
+            f"[STUB] ORDEM ativo={asset_key} api={api_asset} dir={direction} "
+            f"valor={valor:.2f} tf={tf}m tipo={option_type}"
         )
-        return 0.0
+        return True, 0.0
 
     try:
         if option_type == "digital":
-            status, order_id = iq.buy_digital_spot_v2(
-                api_asset, valor, direction.lower(), tf
-            )
+            status, order_id = iq.buy_digital_spot_v2(api_asset, valor, direction.lower(), tf)
         else:
-            status, order_id = iq.buy(
-                valor, api_asset, direction.lower(), tf
-            )
+            status, order_id = iq.buy(valor, api_asset, direction.lower(), tf)
 
         if status:
             logger.event(
-                f"ORDEM_ACEITA  ativo={asset_key}  api={api_asset}  dir={direction}  "
-                f"valor={valor:.2f}  tf={tf}m  tipo={option_type}  id={order_id}"
+                f"ORDEM_ACEITA ativo={asset_key} api={api_asset} dir={direction} "
+                f"valor={valor:.2f} tf={tf}m tipo={option_type} id={order_id}"
             )
-            print(
-                f"[ORDEM] ✓ {asset_key}  {direction}  ${valor:.2f}  "
-                f"{option_type.upper()}  (id={order_id})"
-            )
-        else:
-            logger.event(
-                f"ORDEM_RECUSADA  ativo={asset_key}  api={api_asset}  "
-                f"dir={direction}  motivo={order_id}"
-            )
-            print(f"[ORDEM] ✗ {asset_key}  RECUSADA: {order_id}")
+            print(f"[ORDEM] ✓ {asset_key} {direction} ${valor:.2f} {option_type.upper()} (id={order_id})")
+            return True, 0.0
+
+        logger.event(f"ORDEM_RECUSADA ativo={asset_key} api={api_asset} dir={direction} motivo={order_id}")
+        print(f"[ORDEM] ✗ {asset_key} RECUSADA: {order_id}")
+        return False, 0.0
 
     except Exception as exc:
-        logger.event(f"ERRO_ORDEM  ativo={asset_key}  erro={exc}")
+        logger.event(f"ERRO_ORDEM ativo={asset_key} erro={exc}")
         print(f"[ORDEM] ERRO em {asset_key}: {exc}")
-
-    return 0.0
+        return False, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -699,11 +588,6 @@ def fetch_candles(iq, api_asset: str, tf: int,
                   n: int = 50,
                   history: Optional[dict] = None,
                   retries: int = 3) -> tuple[list[float], list[float], list[float]]:
-    """
-    Obtém candles com retries.
-    Fallback ao histórico anterior em caso de falha.
-    Stub se iq=None.
-    """
     if history is None:
         history = {}
 
@@ -711,8 +595,8 @@ def fetch_candles(iq, api_asset: str, tf: int,
         return _stub_candles(api_asset, history)
 
     for attempt in range(retries):
-        done:    threading.Event  = threading.Event()
-        holder:  list             = []
+        done: threading.Event = threading.Event()
+        holder: list = []
 
         def _get():
             try:
@@ -726,58 +610,60 @@ def fetch_candles(iq, api_asset: str, tf: int,
         threading.Thread(target=_get, daemon=True).start()
         done.wait(timeout=15)
 
-        if (done.is_set() and holder
-                and not isinstance(holder[0], Exception)
-                and holder[0]):
+        if done.is_set() and holder and not isinstance(holder[0], Exception) and holder[0]:
             candles = holder[0]
             closes = [float(c["close"]) for c in candles]
-            highs  = [float(c["max"])   for c in candles]
-            lows   = [float(c["min"])   for c in candles]
+            highs = [float(c["max"]) for c in candles]
+            lows = [float(c["min"]) for c in candles]
             history[api_asset] = {"closes": closes, "highs": highs, "lows": lows}
             return closes, highs, lows
 
         if attempt < retries - 1:
             time.sleep(2)
 
-    # fallback ao histórico
     h = history.get(api_asset, {"closes": [], "highs": [], "lows": []})
     return h["closes"], h["highs"], h["lows"]
 
 
-def _stub_candles(api_asset: str,
-                  history: dict) -> tuple[list[float], list[float], list[float]]:
+def _stub_candles(api_asset: str, history: dict) -> tuple[list[float], list[float], list[float]]:
     import random
-    h    = history.get(api_asset, {"closes": [], "highs": [], "lows": []})
+    h = history.get(api_asset, {"closes": [], "highs": [], "lows": []})
     last = h["closes"][-1] if h["closes"] else 1.1000
 
     close = round(last + random.uniform(-0.0010, 0.0010), 5)
-    high  = round(close + random.uniform(0.0001, 0.0005), 5)
-    low   = round(close - random.uniform(0.0001, 0.0005), 5)
+    high = round(close + random.uniform(0.0001, 0.0005), 5)
+    low = round(close - random.uniform(0.0001, 0.0005), 5)
 
     h["closes"] = (h["closes"] + [close])[-60:]
-    h["highs"]  = (h["highs"]  + [high])[-60:]
-    h["lows"]   = (h["lows"]   + [low])[-60:]
+    h["highs"] = (h["highs"] + [high])[-60:]
+    h["lows"] = (h["lows"] + [low])[-60:]
     history[api_asset] = h
     return h["closes"], h["highs"], h["lows"]
 
 
 def _sleep_until_next_candle(tf: int, stub: bool = False) -> None:
-    """Aguarda até o próximo candle fechado. Stub: dorme 1 s."""
     if stub:
         time.sleep(1)
         return
-    now     = datetime.now()
+    now = datetime.now()
     seconds = now.second + now.microsecond / 1_000_000
-    wait    = (tf * 60) - (seconds % (tf * 60))
+    wait = (tf * 60) - (seconds % (tf * 60))
     time.sleep(max(wait + 0.5, 1))
 
 
+def _fmt_hhmmss(seconds: float) -> str:
+    s = int(max(0, seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    return f"{h:02d}:{m:02d}:{sec:02d}"
+
+
 # ---------------------------------------------------------------------------
-# 13. MENU INTERATIVO
+# 13. MENU INTERATIVO (com timers)
 # ---------------------------------------------------------------------------
 
 def _ask(prompt: str, options: list[str], default: str = "") -> str:
-    """Pede entrada e valida contra opções (case-insensitive)."""
     opts_str = "/".join(options)
     while True:
         ans = input(f"{prompt} [{opts_str}]: ").strip()
@@ -822,11 +708,6 @@ def _ask_int(prompt: str, min_val: int, max_val: int, default: int) -> int:
 
 
 def run_menu(email: str) -> dict:
-    """
-    Menu interativo exibido a cada execução.
-    Pergunta: conta, TF, mercado, n_ativos, valor, stop win/loss, max entradas.
-    Retorna dicionário com os parâmetros da sessão.
-    """
     print()
     print("=" * 60)
     print("        MetodoBOTDIN  —  Menu de Inicialização")
@@ -834,15 +715,18 @@ def run_menu(email: str) -> dict:
     print(f"  Usuário : {email}")
     print()
 
-    tipo_conta  = _ask("  1. Conta", ["demo", "real"], default="demo")
-    tf_str      = _ask("  2. Timeframe", ["M1", "M5"], default="M1")
-    tf          = 1 if tf_str.upper() == "M1" else 5
-    market      = _ask("  3. Mercado", ["OP", "OTC"], default="OP").lower()
-    n_assets    = _ask_int("  4. Ativos simultâneos", 1, 4, default=1)
-    valor       = _ask_float("  5. Valor por entrada", default=1.0)
-    stop_win    = _ask_float("  6. Stop Win  (0 = desabilitado)", default=0.0)
-    stop_loss   = _ask_float("  7. Stop Loss (0 = desabilitado)", default=0.0)
+    tipo_conta = _ask("  1. Conta", ["demo", "real"], default="demo")
+    tf_str = _ask("  2. Timeframe", ["M1", "M5"], default="M1")
+    tf = 1 if tf_str.upper() == "M1" else 5
+    market = _ask("  3. Mercado", ["OP", "OTC"], default="OP").lower()
+    n_assets = _ask_int("  4. Ativos simultâneos", 1, 4, default=1)
+    valor = _ask_float("  5. Valor por entrada", default=1.0)
+    stop_win = _ask_float("  6. Stop Win  (0 = desabilitado)", default=0.0)
+    stop_loss = _ask_float("  7. Stop Loss (0 = desabilitado)", default=0.0)
     max_entries = _ask_int("  8. Max entradas (0 = sem limite)", 0, 9999, default=10)
+
+    session_max_minutes = _ask_int("  9. Duração máxima da sessão (0 = sem limite)", 0, 24 * 60, default=120)
+    idle_stop_minutes = _ask_int("  10. Parar por inatividade (min sem ORDEM ACEITA; 0 = desabilitado)", 0, 24 * 60, default=20)
 
     print()
     print("=" * 60)
@@ -853,6 +737,8 @@ def run_menu(email: str) -> dict:
     print(f"  Entrada     : {valor:.2f}")
     print(f"  Stop Win    : {stop_win:.2f}   |   Stop Loss : {stop_loss:.2f}")
     print(f"  Max entradas: {max_entries if max_entries > 0 else 'sem limite'}")
+    print(f"  Sessão máx  : {session_max_minutes} min" if session_max_minutes > 0 else "  Sessão máx  : sem limite")
+    print(f"  Inatividade : {idle_stop_minutes} min" if idle_stop_minutes > 0 else "  Inatividade : desabilitado")
     print("=" * 60)
     print()
 
@@ -862,41 +748,46 @@ def run_menu(email: str) -> dict:
         sys.exit(0)
 
     return {
-        "tipo_conta":  tipo_conta,
-        "timeframe":   tf,
-        "market":      market,
-        "n_assets":    n_assets,
-        "valor":       valor,
-        "stop_win":    stop_win,
-        "stop_loss":   stop_loss,
+        "tipo_conta": tipo_conta,
+        "timeframe": tf,
+        "market": market,
+        "n_assets": n_assets,
+        "valor": valor,
+        "stop_win": stop_win,
+        "stop_loss": stop_loss,
         "max_entries": max_entries,
+        "session_max_minutes": session_max_minutes,
+        "idle_stop_minutes": idle_stop_minutes,
     }
 
 
 # ---------------------------------------------------------------------------
-# 14. LOOP PRINCIPAL
+# 14. LOOP PRINCIPAL (com timers + contador)
 # ---------------------------------------------------------------------------
 
 def run_bot(session: dict, pool: list[dict], periods: dict,
-            iq, logger: SessionLogger) -> None:
-    """
-    Loop principal do bot.
-    - Itera sobre o pool a cada candle fechado.
-    - Avalia sinais e executa entradas controladas.
-    """
-    tf           = session["timeframe"]
-    valor        = session["valor"]
-    tipo_conta   = session["tipo_conta"]
-    entry_mgr    = EntryManager(
-        session["max_entries"], session["stop_win"], session["stop_loss"]
-    )
+            iq, logger: SessionLogger, email: str, senha: str) -> None:
+    tf = session["timeframe"]
+    valor = session["valor"]
+    tipo_conta = session["tipo_conta"]
+
+    entry_mgr = EntryManager(session["max_entries"], session["stop_win"], session["stop_loss"])
     candle_history: dict = {}
-    min_candles   = max(v for k, v in periods.items() if isinstance(v, int))
+    min_candles = max(v for k, v in periods.items() if isinstance(v, int))
+
+    start_ts = time.time()
+    last_order_accepted_ts = start_ts
+
+    session_max_minutes = int(session.get("session_max_minutes", 120) or 0)
+    idle_stop_minutes = int(session.get("idle_stop_minutes", 20) or 0)
+
+    session_max_seconds = session_max_minutes * 60 if session_max_minutes > 0 else 0
+    idle_stop_seconds = idle_stop_minutes * 60 if idle_stop_minutes > 0 else 0
 
     logger.event(
-        f"Parâmetros: tf={tf}m  valor={valor:.2f}  mercado={session['market'].upper()}  "
-        f"max_entradas={session['max_entries']}  stop_win={session['stop_win']:.2f}  "
-        f"stop_loss={session['stop_loss']:.2f}"
+        f"Parâmetros: tf={tf}m valor={valor:.2f} mercado={session['market'].upper()} "
+        f"max_entradas={session['max_entries']} stop_win={session['stop_win']:.2f} "
+        f"stop_loss={session['stop_loss']:.2f} session_max_min={session_max_minutes} idle_stop_min={idle_stop_minutes}"
     )
     logger.event(f"Pool: {[p['asset_key'] for p in pool]}")
 
@@ -904,6 +795,34 @@ def run_bot(session: dict, pool: list[dict], periods: dict,
 
     try:
         while True:
+            now_ts = time.time()
+
+            # timer sessão
+            if session_max_seconds > 0:
+                remaining = session_max_seconds - (now_ts - start_ts)
+                if remaining <= 0:
+                    msg = f"[TIMER] Sessão encerrada por tempo máximo ({session_max_minutes} min)."
+                    print(msg)
+                    logger.event(msg)
+                    break
+                remain_txt = _fmt_hhmmss(remaining)
+            else:
+                remain_txt = "SEM LIMITE"
+
+            # timer inatividade
+            if idle_stop_seconds > 0:
+                idle_elapsed = now_ts - last_order_accepted_ts
+                if idle_elapsed >= idle_stop_seconds:
+                    msg = f"[TIMER] Sessão encerrada por inatividade ({idle_stop_minutes} min sem ORDEM ACEITA)."
+                    print(msg)
+                    logger.event(msg)
+                    break
+                idle_txt = f"{_fmt_hhmmss(idle_elapsed)}/{_fmt_hhmmss(idle_stop_seconds)}"
+            else:
+                idle_txt = "OFF"
+
+            print(f"[TIMER] restante={remain_txt} | inatividade={idle_txt} | trades={entry_mgr.accepted}")
+
             can_enter_global, block_reason = entry_mgr.can_enter()
             if not can_enter_global:
                 print(f"\n[BOT] Encerramento: {block_reason}")
@@ -912,90 +831,83 @@ def run_bot(session: dict, pool: list[dict], periods: dict,
 
             # Verifica/renova conexão
             if iq is not None:
-                if not ensure_connected(iq, tipo_conta):
+                iq, ok = ensure_connected(iq, email, senha, tipo_conta)
+                if not ok:
                     logger.event("[ERRO] Reconexão falhou. Encerrando.")
                     print("[ERRO] Não foi possível reconectar. Encerrando.")
                     break
 
             for item in pool:
-                asset_key   = item["asset_key"]
-                api_asset   = item["api_asset"]
+                asset_key = item["asset_key"]
+                api_asset = item["api_asset"]
                 option_type = item["option_type"]
-                ts_now      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                closes, highs, lows = fetch_candles(
-                    iq, api_asset, tf, n=50, history=candle_history
-                )
+                closes, highs, lows = fetch_candles(iq, api_asset, tf, n=50, history=candle_history)
 
                 if len(closes) < min_candles:
-                    logger.event(
-                        f"AGUARDANDO  ativo={asset_key}  "
-                        f"candles={len(closes)}/{min_candles}"
-                    )
+                    logger.event(f"AGUARDANDO ativo={asset_key} candles={len(closes)}/{min_candles}")
                     continue
 
                 price = closes[-1]
-                ind   = compute_indicators(closes, highs, lows, periods)
-                sig   = check_signal(ind, price)
+                ind = compute_indicators(closes, highs, lows, periods)
+                sig = check_signal(ind, price)
 
                 if sig["confirmed"]:
                     can_now, blk = entry_mgr.can_enter()
                     if can_now:
                         status = "CONFIRMADO"
                         motivo = sig["reason"]
-                        # Console: SOMENTE sinais confirmados
+
                         print(
                             f"[SINAL] {ts_now}  {asset_key}  {sig['direction']}  "
-                            f"conf={sig['confidence']}%  tf={tf}m  "
-                            f"{option_type.upper()}  [{status}]"
+                            f"conf={sig['confidence']}%  tf={tf}m  {option_type.upper()}  [{status}]"
                         )
                         logger.event(
-                            f"CONFIRMADO  ativo={asset_key}  dir={sig['direction']}  "
-                            f"conf={sig['confidence']}%  motivo={motivo}  "
-                            f"tipo={option_type}"
+                            f"CONFIRMADO ativo={asset_key} dir={sig['direction']} "
+                            f"conf={sig['confidence']}% motivo={motivo} tipo={option_type}"
                         )
-                        pnl = execute_order(iq, item, sig["direction"], valor, tf, logger)
-                        entry_mgr.register_entry(pnl)
+
+                        accepted, pnl = execute_order(iq, item, sig["direction"], valor, tf, logger)
+                        if accepted:
+                            last_order_accepted_ts = time.time()
+                            entry_mgr.register_entry(pnl)
+                        else:
+                            # ordem recusada não conta como trade aceito
+                            pass
                     else:
                         status = "BLOQUEADO"
                         motivo = blk
-                        logger.event(
-                            f"BLOQUEADO  ativo={asset_key}  dir={sig['direction']}  "
-                            f"motivo={motivo}"
-                        )
+                        logger.event(f"BLOQUEADO ativo={asset_key} dir={sig['direction']} motivo={motivo}")
                 elif sig["direction"] is not None:
                     status = "DETECTADO"
                     motivo = sig["reason"]
-                    logger.event(
-                        f"DETECTADO  ativo={asset_key}  dir={sig['direction']}  "
-                        f"conf={sig['confidence']}%  motivo={motivo}"
-                    )
+                    logger.event(f"DETECTADO ativo={asset_key} dir={sig['direction']} conf={sig['confidence']}% motivo={motivo}")
                 else:
                     status = "SEM_SINAL"
                     motivo = sig["reason"]
-                    logger.event(f"SEM_SINAL  ativo={asset_key}  motivo={motivo}")
+                    logger.event(f"SEM_SINAL ativo={asset_key} motivo={motivo}")
 
-                # Grava no CSV (análise posterior)
                 logger.write_signal({
-                    "timestamp":            ts_now,
-                    "ativo":                asset_key,
-                    "option_type":          option_type,
-                    "direcao":              sig.get("direction") or "",
-                    "timeframe":            tf,
-                    "confianca_pct":        sig["confidence"],
-                    "status":               status,
-                    "ema_a":                ind.get("ema_a", ""),
-                    "ema_b":                ind.get("ema_b", ""),
-                    "ema_c":                ind.get("ema_c", ""),
-                    "ema_d":                ind.get("ema_d", ""),
-                    "donchian_up":          ind.get("donchian_up", ""),
-                    "donchian_dn":          ind.get("donchian_dn", ""),
-                    "ta":                   ind.get("ta", ""),
-                    "tb":                   ind.get("tb", ""),
-                    "enc":                  ind.get("enc", ""),
-                    "env":                  ind.get("env", ""),
+                    "timestamp": ts_now,
+                    "ativo": asset_key,
+                    "option_type": option_type,
+                    "direcao": sig.get("direction") or "",
+                    "timeframe": tf,
+                    "confianca_pct": sig["confidence"],
+                    "status": status,
+                    "ema_a": ind.get("ema_a", ""),
+                    "ema_b": ind.get("ema_b", ""),
+                    "ema_c": ind.get("ema_c", ""),
+                    "ema_d": ind.get("ema_d", ""),
+                    "donchian_up": ind.get("donchian_up", ""),
+                    "donchian_dn": ind.get("donchian_dn", ""),
+                    "ta": ind.get("ta", ""),
+                    "tb": ind.get("tb", ""),
+                    "enc": ind.get("enc", ""),
+                    "env": ind.get("env", ""),
                     "tendencia_confirmada": sig.get("tendencia_confirmada", False),
-                    "motivo":               motivo,
+                    "motivo": motivo,
                 })
 
             _sleep_until_next_candle(tf, stub=(iq is None))
@@ -1017,7 +929,6 @@ def _ensure_runtime_dirs() -> None:
 def main() -> None:
     _ensure_runtime_dirs()
 
-    # --- Configuração ---
     config_path = Path("config.txt")
     if not config_path.exists():
         print(f"[ERRO] {config_path} não encontrado.")
@@ -1027,8 +938,8 @@ def main() -> None:
     cfg = load_config(str(config_path))
 
     login_section = cfg.get("LOGIN", {})
-    estrategia    = cfg.get("ESTRATEGIA", {})
-    logs_section  = cfg.get("LOGS", {})
+    estrategia = cfg.get("ESTRATEGIA", {})
+    logs_section = cfg.get("LOGS", {})
 
     email = _cfg_str(login_section, "email")
     senha = _cfg_str(login_section, "senha")
@@ -1037,50 +948,43 @@ def main() -> None:
         print("[ERRO] Preencha email e senha em config.txt, seção [LOGIN].")
         sys.exit(1)
 
-    # Diagnóstico
     diag = _truthy(_cfg_str(logs_section, "print_diagnostics", "true"))
     print_diagnostics(diag)
 
-    # WS patch
     ws_patch = _truthy(_cfg_str(logs_section, "enable_ws_on_message_patch", "true"))
     _apply_ws_patch(ws_patch)
 
-    # Períodos dos indicadores (lidos do config.txt [ESTRATEGIA])
     periods = {
-        "ema_a":       _cfg_int(estrategia, "ema_a",       3),
-        "ema_b":       _cfg_int(estrategia, "ema_b",       7),
-        "ema_c":       _cfg_int(estrategia, "ema_c",       17),
-        "ema_d":       _cfg_int(estrategia, "ema_d",       34),
-        "donchian":    _cfg_int(estrategia, "donchian",    20),
-        "ta":          _cfg_int(estrategia, "ta",          5),
-        "tb":          _cfg_int(estrategia, "tb",          5),
+        "ema_a": _cfg_int(estrategia, "ema_a", 3),
+        "ema_b": _cfg_int(estrategia, "ema_b", 7),
+        "ema_c": _cfg_int(estrategia, "ema_c", 17),
+        "ema_d": _cfg_int(estrategia, "ema_d", 34),
+        "donchian": _cfg_int(estrategia, "donchian", 20),
+        "ta": _cfg_int(estrategia, "ta", 5),
+        "tb": _cfg_int(estrategia, "tb", 5),
         "enc_percent": _cfg_float(estrategia, "enc_percent", 0.001),
     }
 
-    # --- Ativos ---
     ativos_path = Path("Ativos.txt")
     if not ativos_path.exists():
         print(f"[ERRO] {ativos_path} não encontrado.")
         sys.exit(1)
 
     all_assets = load_assets_by_section(str(ativos_path))
-    total_raw  = sum(len(v) for v in all_assets.values())
-    non_empty  = sum(1 for v in all_assets.values() if v)
+    total_raw = sum(len(v) for v in all_assets.values())
+    non_empty = sum(1 for v in all_assets.values() if v)
     print(f"[INFO] Ativos.txt: {total_raw} entrada(s) em {non_empty} seção(ões)")
 
-    # --- Menu ---
     session = run_menu(email)
-    market  = session["market"]
-    tf      = session["timeframe"]
-    tf_str  = f"M{tf}"
+    market = session["market"]
+    tf = session["timeframe"]
+    tf_str = f"M{tf}"
 
-    # Seções relevantes para o TF escolhido
     raw_digital = all_assets.get(f"DIGITAL {tf_str}", [])
-    raw_binary  = all_assets.get(f"BINARIA {tf_str}", [])
+    raw_binary = all_assets.get(f"BINARIA {tf_str}", [])
 
-    # Normaliza e filtra por mercado
     digital_assets = filter_assets_for_market(raw_digital, market)
-    binary_assets  = filter_assets_for_market(raw_binary,  market)
+    binary_assets = filter_assets_for_market(raw_binary, market)
 
     if not digital_assets and not binary_assets:
         print(
@@ -1095,23 +999,21 @@ def main() -> None:
         f"Binária: {len(binary_assets)} | Mercado: {market.upper()}"
     )
 
-    # --- Logger de sessão ---
-    log_dir     = _cfg_str(logs_section, "log_dir", "logs")
+    log_dir = _cfg_str(logs_section, "log_dir", "logs")
     session_tag = _cfg_str(logs_section, "session_tag", "").strip()
     if not session_tag:
         session_tag = f"m{tf}_{market}"
 
     logger = SessionLogger(log_dir=log_dir, session_tag=session_tag)
     logger.event(
-        f"Sessão | conta={session['tipo_conta'].upper()} | "
-        f"tf=M{tf} | mercado={market.upper()} | "
+        f"Sessão | conta={session['tipo_conta'].upper()} | tf=M{tf} | mercado={market.upper()} | "
         f"ativos={session['n_assets']} | valor={session['valor']:.2f} | "
         f"stopwin={session['stop_win']:.2f} | stoploss={session['stop_loss']:.2f} | "
-        f"maxentradas={session['max_entries']}"
+        f"maxentradas={session['max_entries']} | "
+        f"session_max_min={session['session_max_minutes']} | idle_stop_min={session['idle_stop_minutes']}"
     )
     print(f"[INFO] Logs em: {log_dir}/{date.today().isoformat()}/")
 
-    # --- Conexão ---
     iq = None
     try:
         iq, ok = connect_iq(email, senha, session["tipo_conta"])
@@ -1124,7 +1026,6 @@ def main() -> None:
         print("[AVISO] iqoptionapi não encontrada. Rodando em modo SIMULAÇÃO (stub).")
         logger.event("[AVISO] iqoptionapi ausente; modo stub ativo")
 
-    # --- Pool ---
     try:
         pool = build_pool(digital_assets, binary_assets, session["n_assets"], iq, logger)
     except KeyboardInterrupt:
@@ -1132,9 +1033,8 @@ def main() -> None:
         logger.close()
         sys.exit(0)
 
-    # --- Loop ---
     try:
-        run_bot(session, pool, periods, iq, logger)
+        run_bot(session, pool, periods, iq, logger, email=email, senha=senha)
     finally:
         logger.close()
         print("[BOT] Encerrado.")
