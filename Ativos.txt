@@ -1,0 +1,23 @@
+# ============================================================
+# Ativos.txt - Lista de ativos para operação
+# Um ativo por linha. Linhas com # são comentários.
+# Use o nome exato como aparece na IQ Option API.
+# Exemplo OTC:  EURUSD-OTC
+# Exemplo OP:   EURUSD
+# ============================================================
+
+# --- Forex OTC (fora de horário) ---
+# EURUSD-OTC
+# GBPUSD-OTC
+# USDJPY-OTC
+# AUDUSD-OTC
+
+# --- Forex OP (mercado aberto) ---
+EURUSD
+GBPUSD
+USDJPY
+AUDUSD
+USDCAD
+USDCHF
+NZDUSD
+EURGBP

@@ -1,0 +1,4 @@
+# Dependências externas do MetodoBOTDIN
+# A iqoptionapi é carregada da pasta local iqoptionapi/ (não instalar via pip)
+
+websocket-client==1.9.0
