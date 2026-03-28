@@ -1,0 +1,34 @@
+# Runtime folders - generated at runtime, do not commit
+logs/
+state/
+presets/
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / real config (keep config.txt as template only)
+config.local.txt
+*.env
+
+# Temporary files
+*.tmp
+*.bak
