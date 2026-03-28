@@ -25,9 +25,10 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Secrets / real config (keep config.txt as template only)
-config.local.txt
+# Credentials - keep config.example.txt in repo; create config.txt locally
+config.txt
 *.env
+*.local
 
 # Temporary files
 *.tmp

@@ -1,0 +1,44 @@
+# ============================================================
+# MetodoBOTDIN - config.example.txt
+# Modelo de configuração SEM credenciais reais.
+# Copie este arquivo para config.txt e preencha suas credenciais.
+# ============================================================
+
+[LOGIN]
+# Credenciais IQ Option  (substitua pelos seus dados)
+email = SEU_EMAIL@EXEMPLO.COM
+senha = SUA_SENHA
+
+[ESTRATEGIA]
+# Períodos das EMAs (EMAA / EMAB / EMAC / EMAD)
+# Quanto menor o valor, mais rápida a EMA (mais sensível ao preço).
+ema_a = 3
+ema_b = 7
+ema_c = 17
+ema_d = 34
+
+# Período do Canal Donchian
+donchian = 20
+
+# Períodos de TA/TB (EMA auxiliar de máximos/mínimos)
+ta = 5
+tb = 5
+
+# Percentual do envelope ENC/ENV em torno de ema_b (ex.: 0.001 = 0.1%)
+# TODO: ajuste conforme a lógica definitiva do QuadCode
+enc_percent = 0.001
+
+[LOGS]
+# Pasta base para os logs (subpastas por data criadas automaticamente)
+log_dir = logs
+
+# Tag opcional para identificar a sessão nos nomes dos arquivos
+# Exemplo: session_tag = m1_op  →  signals_YYYY-MM-DD_HH-MM-SS_m1_op.csv
+session_tag =
+
+# Patch websocket: corrige erro 'on_message() takes 2 positional arguments but 3 were given'
+# Recomendado: true para Windows + websocket-client >= 1.7
+enable_ws_on_message_patch = true
+
+# Exibe diagnóstico de ambiente (Python, iqoptionapi, websocket) ao iniciar
+print_diagnostics = true
