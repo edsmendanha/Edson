@@ -1,48 +1,45 @@
+"""
+MetodoBOTDIN.py  —  Bot de sinais para IQ Option
+"""
+
+from iqoptionapi.stable_api import IQ_Option
 import time
 
-class BotDIn:
-    def __init__(self):
-        self.session_max_minutes = 120  # Default session max minutes
-        self.idle_stop_minutes = 20       # Default idle stop minutes
-        self.start_time = time.time()
-        self.last_activity_time = time.time()
+# Initialization variables
+email = "your_email@example.com"
+senha = "your_password"
 
-    def connect(self):
-        # Connect to the IQ Option without threads, with small sleep and change_balance 
-        print("Connecting to IQ Option...")
-        # Implement the connection logic according to BOTDIN8VELAS
-        time.sleep(1)  # Replace with actual connection code
+# Connect to IQ Option
+ok, reason = connect()
+sleep(1)
+change_balance()  # Function defined elsewhere
 
-    def execute_order(self):
-        # Order execution logic that returns accepted boolean
-        accepted = True  # Logic to determine if order was accepted
-        self.reset_idle_timer()
-        return accepted
+# Create a timer for session management
+session_max_minutes = 120
+idle_stop_minutes = 20
 
-    def reset_idle_timer(self):
-        self.last_activity_time = time.time()
+# Function that controls the menu
+def run_menu():
+    # code for menu
+    pass
 
-    def remaining_time(self):
-        elapsed_time = time.time() - self.start_time
-        remaining = (self.session_max_minutes * 60) - elapsed_time
-        return max(0, remaining)
+# Print remaining time + idle timer counter for candle/cycle
 
-    def enforce_stop_conditions(self):
-        idle_time = (time.time() - self.last_activity_time) / 60
-        if self.remaining_time() <= 0 or idle_time >= self.idle_stop_minutes:
-            print("Session ended due to time limits.")
-            return True
-        return False
+# Main bot function
 
-    def run(self):
-        self.connect()
-        while True:
-            if self.enforce_stop_conditions():
-                break
-            print(f"Remaining time: {self.remaining_time()} seconds")
-            # Here would be the logic to handle candle events, etc.
-            time.sleep(1)  # Main loop delay
+def run_bot(email, senha):
+    # Create IQ object with credentials
+iq = IQ_Option(email, senha)
+    accepted, pnl = execute_order()  # Execute order and return is accepted
+    if accepted:
+        # Reset idle timer
+        reset_idle_timer()
+    # Keep other function behaviors intact
 
-# Instantiate and run the bot
-bot = BotDIn()
-bot.run()
+# Code for execute_order function
+def execute_order():
+    # order logic goes here
+    return accepted, pnl
+
+# Additional logic as necessary
+# More sections if required, following the specified changes.
